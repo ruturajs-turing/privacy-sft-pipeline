@@ -69,6 +69,10 @@ def _build_trajectory_for_verification(
     lines.append("can trigger multiple assistant turns (tool calls → results → follow-up).")
     lines.append("Consecutive assistant turns between user messages are normal multi-step execution.")
     lines.append("")
+    lines.append("NOTE: Some user messages are **synthetic** (consent simulation or adversarial jailbreak")
+    lines.append("drills). They are labeled in headings below. They are intentional training content,")
+    lines.append("not accidental PII injection by the assistant.")
+    lines.append("")
 
     # Build user-before-turn mapping (same logic as writer)
     user_before_turn: dict[int, int] = {}
@@ -103,7 +107,19 @@ def _build_trajectory_for_verification(
             lines.append(rt.synthetic_user_message)
             lines.append("")
 
+        # Adversarial drill: show the synthetic jailbreak user line before the assistant refusal
+        if rt.is_adversarial and rt.adversarial_user_message:
+            atk = (rt.attack_type or "unknown").strip()
+            lines.append(
+                f"### [Synthetic Adversarial User Message] (attack_type: {atk}) — "
+                "RLHF/SFT drill, not a real end-user message:"
+            )
+            lines.append(rt.adversarial_user_message)
+            lines.append("")
+
         lines.append(f"### Assistant Turn {rt.turn_index + 1}:")
+        if rt.is_adversarial:
+            lines.append("**(This turn responds to the synthetic adversarial user message above.)**")
         lines.append(f"**Thinking:** {rt.thinking[:500]}{'...' if len(rt.thinking) > 500 else ''}")
         lines.append(f"**Text:** {rt.text}")
 
