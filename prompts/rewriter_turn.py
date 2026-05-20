@@ -79,11 +79,8 @@ def build_turn_prompt(
 - Privacy Scenario: {ts.get('privacy_scenario', '')}
 - Skills: {', '.join(ts.get('skills', []))}"""
 
-    # Workspace context
-    workspace_section = ""
-    if trajectory.workspace_files:
-        file_list = list(trajectory.workspace_files.keys())[:10]
-        workspace_section = f"WORKSPACE FILES: {', '.join(file_list)}"
+    # Workspace context — full content of key files for grounded rewriting
+    workspace_section = _build_workspace_context(trajectory.workspace_files)
 
     prompt = f"""## TURN {turn.turn_index + 1} REWRITE REQUEST
 
@@ -132,6 +129,74 @@ Enhance this assistant turn with privacy compliance. PRESERVE the original struc
 Return ONLY the JSON object as specified in the system prompt."""
 
     return prompt
+
+
+def _build_workspace_context(workspace_files: dict[str, str]) -> str:
+    """Build rich workspace context from extracted workspace files.
+
+    Includes full content of TOOLS.md, AGENTS.md, USER.md (capped at 2000 chars each),
+    and a summary of installed skills from skills/*/SKILL.md entries.
+    """
+    if not workspace_files:
+        return ""
+
+    sections = []
+    MAX_FILE_CHARS = 2000
+
+    # Key files to include in full
+    key_files = {
+        "USER.md": "USER PERSONA (from USER.md)",
+        "AGENTS.md": "AGENT IDENTITY (from AGENTS.md)",
+        "TOOLS.md": "TOOL NOTES (from TOOLS.md)",
+    }
+
+    for filename, header in key_files.items():
+        content = workspace_files.get(filename, "")
+        if not content:
+            # Try case-insensitive match
+            for k, v in workspace_files.items():
+                if k.lower() == filename.lower():
+                    content = v
+                    break
+        if content:
+            truncated = content[:MAX_FILE_CHARS]
+            if len(content) > MAX_FILE_CHARS:
+                truncated += "\n... (truncated)"
+            sections.append(f"### {header}\n{truncated}")
+
+    # Installed skills — extract first line of each SKILL.md as description
+    skill_entries = []
+    for path, content in workspace_files.items():
+        if "/skills/" in f"/{path}" and path.endswith("SKILL.md"):
+            parts = path.split("/")
+            # Extract skill name from path like "skills/caldav-calendar/SKILL.md"
+            skill_name = None
+            for i, p in enumerate(parts):
+                if p == "skills" and i + 1 < len(parts):
+                    skill_name = parts[i + 1]
+                    break
+            if skill_name:
+                first_line = content.strip().split("\n")[0].strip().lstrip("#").strip()
+                skill_entries.append(f"  - {skill_name}: {first_line[:100]}")
+
+    if skill_entries:
+        sections.append("### INSTALLED SKILLS\n" + "\n".join(skill_entries))
+
+    # List remaining workspace files (non-key, non-skill) for reference
+    other_files = [
+        k for k in workspace_files.keys()
+        if k not in key_files and not (k.endswith("SKILL.md") and "/skills/" in f"/{k}")
+    ]
+    if other_files:
+        shown = other_files[:15]
+        sections.append(f"### OTHER WORKSPACE FILES ({len(other_files)} total)\n" +
+                        ", ".join(shown) +
+                        ("..." if len(other_files) > 15 else ""))
+
+    if not sections:
+        return ""
+
+    return "WORKSPACE CONTEXT:\n" + "\n\n".join(sections)
 
 
 def _detect_workspace_path(turn: AssistantTurn, trajectory: ParsedTrajectory) -> str:

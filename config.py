@@ -40,6 +40,7 @@ GCS_SERVICE_ACCOUNT_PATH = os.getenv(
 
 # Personas
 PERSONAS_PATH = BASE_DIR.parent / "privacy-personas.json"
+PERSONAS_JSON_PATH = PERSONAS_PATH  # alias used by rlhf_data_builder
 TASKS_PATH = BASE_DIR.parent / "privacy-task-generator" / "outputs" / "tasks_all.json"
 
 # Quality gates

@@ -25,6 +25,9 @@ export interface RLHFPair {
   task_id: string;
   submission_id: string;
   turn_index: number;
+  tool_index_in_turn?: number;
+  tools_in_turn?: number;
+  tool_name?: string;
   step_criticality: number;
   pair_level: string;
   decision_branch: string;

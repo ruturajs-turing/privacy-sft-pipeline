@@ -31,7 +31,13 @@ export function RLHFStepCard({ pair }: Props) {
             <span className="text-[10px] font-bold uppercase tracking-wider text-emerald-400">
               Chosen (Optimal)
             </span>
-            <span className="text-[10px] text-slate-500">Turn {pair.turn_index}</span>
+            <span className="text-[10px] text-slate-500">
+              Turn {pair.turn_index}
+              {pair.tool_name ? ` · ${pair.tool_name}` : ""}
+              {pair.tools_in_turn && pair.tools_in_turn > 1 && pair.tool_index_in_turn !== undefined
+                ? ` (${pair.tool_index_in_turn + 1}/${pair.tools_in_turn})`
+                : ""}
+            </span>
           </div>
           <div className="flex items-center gap-2">
             <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-700 text-slate-300">
