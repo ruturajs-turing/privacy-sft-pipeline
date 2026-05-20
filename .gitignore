@@ -1,0 +1,26 @@
+# Environment
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Output data (too large for git)
+test_output/
+output/
+
+# Keys
+gcs-key.json
+*.json.key
+
+# Node
+node_modules/
+dist/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/

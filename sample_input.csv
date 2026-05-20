@@ -1,0 +1,4 @@
+worker_id,submission_id,task_id,export_url
+worker-001,sub-001,T-001-01,exports/sample1/final-snapshot.zip
+worker-002,sub-002,T-033-02,exports/sample2/final-snapshot.zip
+worker-003,sub-003,T-057-05,exports/sample3/final-snapshot.zip

@@ -1,0 +1,35 @@
+{
+  "T1": [
+    "read", "write", "exec", "code-analysis", "data-analysis", "debug-pro",
+    "frontend-design", "nextjs-expert", "sql-toolkit", "ui-ux-pro-max",
+    "ffmpeg", "tesseract-ocr", "surya", "openai-whisper", "sherpa-onnx-tts", "video-frames",
+    "word-docx", "excel-xlsx", "powerpoint-pptx", "nano-pdf", "markdown-converter",
+    "mermaid-diagrams", "excalidraw",
+    "context_window", "context_window_introspection", "memory_search", "self-reflection", "session-logs",
+    "obsidian", "obsidian-vault-maintainer", "wiki-maintainer", "skill-creator", "skill_workshop",
+    "rag_search", "rag_add", "rag_get", "rag_delete", "rag_count", "rag_collections",
+    "vault_get", "vault_set", "vault_list", "vault_delete"
+  ],
+  "T1_PERSISTENCE": [
+    "memory_write", "active_memory_write", "active_memory_set", "wiki_apply"
+  ],
+  "T2": [
+    "enterprise-mail", "enterprise-email", "enterprise-calendar",
+    "enterprise-database", "enterprise-doc-database", "enterprise-gitlab",
+    "enterprise-inference", "enterprise-rag", "enterprise-vault",
+    "enterprise-odoo-contacts", "enterprise-odoo-crm", "enterprise-odoo-hr",
+    "enterprise-odoo-inventory", "enterprise-odoo-invoicing",
+    "enterprise-odoo-manufacturing", "enterprise-odoo-marketing",
+    "enterprise-odoo-pos", "enterprise-odoo-project", "enterprise-odoo-purchase",
+    "enterprise-odoo-sales", "enterprise-odoo-website"
+  ],
+  "T3": [
+    "api-gateway", "browser", "chromium", "web_search", "web_fetch",
+    "gmail", "github", "google-drive", "slack", "notion", "trello",
+    "weather", "flight-search", "stock-analysis",
+    "facebook", "instagram", "linkedin", "reddit", "youtube",
+    "caldav-calendar", "eventbrite", "news-summary", "polymarket",
+    "openrouter-transcribe", "openai-whisper-api", "edge-tts",
+    "clawhub", "skill-hub", "docker.io"
+  ]
+}
