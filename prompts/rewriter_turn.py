@@ -58,16 +58,22 @@ def build_turn_prompt(
     else:
         pii_section = "PII DETECTED: None (L0 content only)"
 
-    # Persona context
+    # Persona context (with personality traits for realistic consent responses)
     persona_section = ""
     if trajectory.persona:
         p = trajectory.persona
+        personality = p.get('personality', {})
         persona_section = f"""PERSONA CONTEXT:
-- Name: {p.get('name', 'Unknown')}
+- Name: {p.get('first_name', p.get('name', 'Unknown'))} {p.get('last_name', '')}
 - Persona ID: {p.get('persona_id', '')}
-- Profession: {p.get('profession', '')}
+- Profession: {p.get('job_title', p.get('profession', ''))}
 - Primary Language: {p.get('primary_language', 'English')}
-- Country: {p.get('country', '')}"""
+- Country: {p.get('city', p.get('country', ''))}
+- Communication Style: {"formal" if personality.get('conscientiousness', 0.5) > 0.7 else "casual"}
+- Openness (data sharing comfort): {personality.get('openness', 0.5):.1f}/1.0 {"(cautious — more likely to deny consent)" if personality.get('openness', 0.5) < 0.4 else "(open — more likely to grant)" if personality.get('openness', 0.5) > 0.6 else "(moderate)"}
+- Conscientiousness: {personality.get('conscientiousness', 0.5):.1f}/1.0 {"(thorough — prefers explicit confirmations)" if personality.get('conscientiousness', 0.5) > 0.7 else "(relaxed — terse responses)"}
+
+Use these traits when generating user_response in consent flows. The user's replies should match their personality — a cautious/low-openness persona denies more often; a casual persona gives short responses."""
 
     # Task spec
     task_section = ""

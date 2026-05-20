@@ -92,6 +92,11 @@ class RewrittenTurn:
     tool_results: list[dict] = field(default_factory=list)
     privacy_actions: list[str] = field(default_factory=list)
     scenario: str = ""
+    synthetic_user_message: str = ""
+    consent_decision: str = ""
+    is_adversarial: bool = False
+    adversarial_user_message: str = ""
+    attack_type: str = ""
 
 
 @dataclass

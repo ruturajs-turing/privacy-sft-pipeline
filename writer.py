@@ -84,14 +84,17 @@ def _turn_to_jsonl_events(
             })
 
     # Assistant message event
+    msg_data: dict = {
+        "role": "assistant",
+        "content": content,
+        "timestamp": ts,
+    }
+    if turn.is_adversarial:
+        msg_data["metadata"] = {"is_adversarial": True, "attack_type": turn.attack_type}
     events.append({
         "type": "message",
         "id": _generate_event_id(),
-        "message": {
-            "role": "assistant",
-            "content": content,
-            "timestamp": ts,
-        }
+        "message": msg_data,
     })
 
     # Tool result events
@@ -143,8 +146,10 @@ def write_trajectory_output(
     user_before_turn: dict[int, int] = _build_user_before_turn_map(trajectory)
 
     # Emit events in thread order
+    emitted_user_msgs: set[int] = set()
     for rt in rewrite_result.turns:
-        if rt.turn_index in user_before_turn:
+        # Emit the original user message preceding this turn (only once per turn_index)
+        if rt.turn_index in user_before_turn and rt.turn_index not in emitted_user_msgs:
             u_idx = user_before_turn[rt.turn_index]
             if u_idx < len(trajectory.user_messages):
                 jsonl_events.append({
@@ -156,6 +161,41 @@ def write_trajectory_output(
                         "timestamp": base_ts + (rt.turn_index * 5000) - 1000,
                     }
                 })
+            emitted_user_msgs.add(rt.turn_index)
+
+        # If this is an adversarial turn, emit the adversarial user message BEFORE the refusal
+        if rt.is_adversarial and rt.adversarial_user_message:
+            jsonl_events.append({
+                "type": "message",
+                "id": _generate_event_id(),
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": rt.adversarial_user_message}],
+                    "timestamp": base_ts + (rt.turn_index * 5000) + 2000,
+                    "metadata": {
+                        "synthetic": True,
+                        "is_adversarial": True,
+                        "attack_type": rt.attack_type,
+                    },
+                }
+            })
+
+        # If this turn has a synthetic user message (consent flow response),
+        # emit it BEFORE the assistant's execution message
+        if rt.synthetic_user_message:
+            jsonl_events.append({
+                "type": "message",
+                "id": _generate_event_id(),
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": rt.synthetic_user_message}],
+                    "timestamp": base_ts + (rt.turn_index * 5000) + 2500,
+                    "metadata": {
+                        "synthetic": True,
+                        "consent_decision": rt.consent_decision,
+                    },
+                }
+            })
 
         # Assistant turn events
         turn_events = _turn_to_jsonl_events(rt, session_id, base_ts)
@@ -273,10 +313,10 @@ def write_sft_entry(
             })
             current_assistant_parts.clear()
 
+    emitted_sft_user: set[int] = set()
     for rt in rewrite_result.turns:
         # Emit user message if this is the first assistant turn after a new user message
-        if rt.turn_index in user_before_turn:
-            # Flush previous assistant group
+        if rt.turn_index in user_before_turn and rt.turn_index not in emitted_sft_user:
             _flush_assistant()
             u_idx = user_before_turn[rt.turn_index]
             if u_idx < len(trajectory.user_messages):
@@ -284,6 +324,24 @@ def write_sft_entry(
                     "role": "user",
                     "content": trajectory.user_messages[u_idx],
                 })
+            emitted_sft_user.add(rt.turn_index)
+
+        # If this is an adversarial turn, flush and insert the adversarial user message
+        if rt.is_adversarial and rt.adversarial_user_message:
+            _flush_assistant()
+            messages.append({
+                "role": "user",
+                "content": rt.adversarial_user_message,
+            })
+
+        # If this turn carries a synthetic user message (consent flow),
+        # flush the previous assistant and insert the user response
+        if rt.synthetic_user_message:
+            _flush_assistant()
+            messages.append({
+                "role": "user",
+                "content": rt.synthetic_user_message,
+            })
 
         # Build assistant content for this turn
         content_parts = []

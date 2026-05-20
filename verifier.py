@@ -86,14 +86,22 @@ def _build_trajectory_for_verification(
         for i in range(min(len(trajectory.user_messages), len(rewrite_result.turns))):
             user_before_turn[i] = i
 
+    emitted_user_indices: set[int] = set()
     for rt in rewrite_result.turns:
-        # Emit user message only when thread_order says it appeared
-        if rt.turn_index in user_before_turn:
+        # Emit user message only when thread_order says it appeared (once per turn_index)
+        if rt.turn_index in user_before_turn and rt.turn_index not in emitted_user_indices:
             u_idx = user_before_turn[rt.turn_index]
             if u_idx < len(trajectory.user_messages):
                 lines.append(f"### User Message {u_idx + 1}:")
                 lines.append(trajectory.user_messages[u_idx])
                 lines.append("")
+            emitted_user_indices.add(rt.turn_index)
+
+        # If this turn has a synthetic user consent message, show it before the execution
+        if rt.synthetic_user_message:
+            lines.append(f"### [Synthetic User Consent Response] (decision: {rt.consent_decision}):")
+            lines.append(rt.synthetic_user_message)
+            lines.append("")
 
         lines.append(f"### Assistant Turn {rt.turn_index + 1}:")
         lines.append(f"**Thinking:** {rt.thinking[:500]}{'...' if len(rt.thinking) > 500 else ''}")
