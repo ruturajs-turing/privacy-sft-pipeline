@@ -5,27 +5,27 @@ Multi-stage pipeline that converts OpenClaw agent trajectories into privacy-comp
 ## Architecture Overview
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                        Privacy SFT Pipeline                                 │
-├──────────┬──────────┬──────────┬──────────┬──────────┬──────────────────────┤
-│ Stage 1  │ Stage 2  │ Stage 3  │ Stage 4  │ Stage 5  │ Stage 6              │
-│ Parse    │ Classify │ Rewrite  │ Verify   │ Write    │ RLHF                 │
-│          │          │          │          │          │                      │
-│ Extract  │ Presidio │ Claude   │ GPT-5.4  │ Output   │ 9 rejected alts      │
-│ from zip │ DLP      │ Opus 4.6 │ verifier │ JSONL +  │ per decision point   │
-│          │ OpenAI   │ rewriter │ + refix  │ SFT +    │ + jailbreak pairs    │
-│          │ Claude   │ + adv    │ loop     │ workspace│                      │
-└──────────┴──────────┴──────────┴──────────┴──────────┴──────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                          Privacy SFT Pipeline                                   │
+├──────────┬───────────┬─────────────┬──────────┬──────────┬─────────────────────┤
+│ Stage 1  │ Stage 2   │ Stage 3     │ Stage 4  │ Stage 5  │ Stage 6             │
+│ Parse    │ Classify  │ Assemble    │ Verify   │ Write    │ RLHF                │
+│          │           │             │          │          │                     │
+│ Extract  │ Claude    │ Privacy     │ GPT-5.4  │ Output   │ 9 rejected alts     │
+│ from GCS │ Opus 4.7  │ Registry    │ verifier │ JSONL +  │ per decision point  │
+│ zip +    │ + Pattern │ (determin-  │ FREE_BAND│ SFT +    │ + jailbreak pairs   │
+│ persona  │ + Presidio│ istic) +    │ aware    │ workspace│                     │
+│ matching │ provenance│ Claude adv  │          │          │                     │
+└──────────┴───────────┴─────────────┴──────────┴──────────┴─────────────────────┘
 ```
 
 ## Models Used
 
 | Stage | Model | Provider | Purpose |
 |-------|-------|----------|---------|
-| PII Classification | **Claude Opus 4.6** | Anthropic | LLM-based PII detection and L0-L4 level assignment |
-| Rewriting | **Claude Opus 4.6** | Anthropic | Privacy-compliant trajectory rewriting with HTG rules |
-| Adversarial Gen | **Claude Opus 4.6** | Anthropic | Generating jailbreak attempts + polite refusals |
-| Verification | **GPT-5.4** | OpenAI | HTG compliance scoring (6-rule rubric, 1-5 scale) |
+| PII Classification | **Claude Opus 4.7** | Anthropic | LLM-based PII detection with per-argument provenance tracking |
+| Assembly | **Claude Opus 4.7** | Anthropic | Adversarial turn generation (text only — decisions are deterministic) |
+| Verification | **GPT-5.4** | OpenAI | HTG compliance scoring (6-rule rubric, FREE_BAND aware) |
 | Reward Scoring | **GPT-5.4** | OpenAI | Process Reward Model for RLHF rejected alternatives |
 
 ## PII Classification (Stage 2)
@@ -53,46 +53,61 @@ The pipeline uses 80+ PII labels mapped to sensitivity levels via `data/classifi
 | **L1 Caution** | `DEV_IP_ADDR`, `DEV_MAC_ADDR`, `DEV_COOKIE`, `DEV_USER_AGENT` | Allowed with minimization |
 | **L0 Public** | `LOC_COUNTRY`, `ORG_PUBLIC`, `FIN_ROUTING_ALONE` | Freely usable |
 
-## Hatch Trust Guidelines (HTG) Framework
+## HTG Framework & FREE_BAND Authorization Matrix
 
-### Data Classification Matrix
+### FREE_BAND (cuarena-pipeline compatible)
 
-| Data Level | Examples | Allowed Tiers | Persistence |
-|-----------|----------|---------------|-------------|
-| L0 Public | General knowledge, broad locations | T1, T2, T3 | Allowed |
-| L1 Caution | Device IDs, IP addresses | T1, T2, T3 | Allowed |
-| L2 Sensitive | Full names, emails, account IDs | T1, T2 only | **Consent required** |
-| L3 Highly Sensitive | Health records, financials, GPS | T1 only (elicit per-turn) | **HARD DENY** |
-| L4 Critical | SSNs, passwords, biometrics | T1 only (zero retention) | **HARD DENY** |
+The authorization matrix determines what's allowed without consent:
 
-### Tool Trust Tiers
+| Tier | Read | Write |
+|------|------|-------|
+| T1 (local) | Free up to L4 | Free up to L2 |
+| T2 (1P cloud) | Free up to L2 | Free up to L2 |
+| T3 (external) | Free up to L1 | Free up to L1 |
 
-| Tool Tier | Description | Max Data Level | Example Tools |
-|-----------|-------------|----------------|---------------|
-| T1 Local | Local execution, read/write, memory | L4 (ephemeral only) | `exec`, `read`, `write`, `memory_search`, `vault_get` |
-| T1 Persistence | Memory/wiki writes | **L2 max** (L3/L4 HARD DENY) | `memory_write`, `active_memory_write`, `wiki_apply` |
-| T2 1P Cloud | Enterprise services | L2 (L3 with consent) | `enterprise-mail`, `enterprise-rag`, `enterprise-database` |
-| T3 3P API | External services | L1 only (L2+ with consent) | `web_search`, `slack`, `notion`, `github`, `gmail` |
+**Special rules:**
+- T1 write + L3/L4 → **HARD DENY** (any local file, not just memory)
+- T2 + L3/L4 → **CONSENT GATE** (Gate 4b)
+- T3 + L2+ → **CONSENT GATE** (Gate 4c)
+
+### Tool Trust Tiers (156 tools)
+
+| Tier | Max Data Level | Example Tools |
+|------|----------------|---------------|
+| T1 Local | L4 (ephemeral only) | `exec`, `read`, `write`, `memory_search`, `vault_get` |
+| T1 Persistence | **L2 max** (L3/L4 HARD DENY) | `memory_write`, `active_memory_write`, `wiki_apply` |
+| T2 1P Cloud | L2 (L3 with consent) | `enterprise-mail`, `enterprise-rag`, `enterprise-database` |
+| T3 3P API | L1 only (L2+ with consent) | `web_search`, `slack`, `notion`, `github`, `gmail` |
 
 ### 5-Step Authorization Procedure
 
 Every tool call is evaluated through:
-1. **Classify** — Determine max sensitivity level of all data elements
-2. **Validate provenance** — For L3+, data must be from current/previous user turn
-3. **Select tool** — Pick lowest-tier tool capable of the task
-4. **Apply gate** — Hard deny, confirm, or allow based on matrix
+1. **Classify** — Determine max sensitivity level of all data in content and arguments
+2. **Validate provenance** — For L3+, verify data comes from current session user messages (amnesia rule)
+3. **Select tool** — Downgrade to lower-tier equivalent if available (e.g., `gmail` → `enterprise-mail`)
+4. **Apply gate** — Hard deny, vault redirect, consent, or allow based on FREE_BAND
 5. **Execute** — Proceed only if gate allows
 
-### Absolute L3/L4 Persistence Ban
+### L3/L4 Provenance & Amnesia Rule
 
-**L3/L4 data must NEVER be persisted regardless of user consent.** Even if the user explicitly says "yes, save my SSN to memory", the model must refuse. This is an absolute policy that consent cannot override.
+L3/L4 data is valid ONLY if the user mentioned it in the current session. Data from memory reads or prior sessions triggers the **amnesia rule** — the agent must ask the user to re-provide it.
 
-The decision logic:
-```
-L(p) >= 3 & target = persistence → ALWAYS DENY (no consent, no exception)
-L(p) == 2 & target = persistence → CONSENT FLOW (ask user)
-L(p) <= 1 → ALLOW
-```
+### Remediation Strategies for L3/L4 Violations
+
+| Strategy | When Used | Behavior |
+|----------|-----------|----------|
+| **Hard Deny** | L3/L4 write, not reused later | Refuse with Hatch string |
+| **Manual Re-input** | L3/L4 write, reused 1-2x later | Deny + explain user must re-provide |
+| **Vault Redirect** | L3/L4 write, reused 3-4x later | Redirect to `vault_set` encrypted storage |
+| **Exception.md** | L3/L4 write, reused 5+ times | Deny + offer documented exception path |
+
+### Tool Tier Downgrade (Condition 1)
+
+When a T3 tool is used but a lower-tier equivalent exists, the pipeline automatically swaps it:
+- `gmail` → `enterprise-mail`
+- `google-calendar-api` → `enterprise-calendar`
+- `google-docs` → `word-docx`
+- Full map in `data/tool_equivalences.json`
 
 ## Multi-Turn Consent Flow
 
@@ -216,7 +231,7 @@ pip install -r requirements.txt
 
 | Variable | Required | Description |
 |----------|----------|-------------|
-| `ANTHROPIC_API_KEY` | Yes | Claude Opus 4.6 API key (rewriter + classifier) |
+| `ANTHROPIC_API_KEY` | Yes | Claude Opus 4.7 API key (classifier + adversarial gen) |
 | `OPENAI_API_KEY` | Yes | GPT-5.4 API key (verifier + reward scorer) |
 | `GOOGLE_APPLICATION_CREDENTIALS` | Optional | Path to GCS service account JSON (DLP engine) |
 | `CONCURRENCY` | Optional | Max concurrent tasks (default: 8) |
@@ -259,16 +274,15 @@ python rlhf_data_builder.py --submission-id <UUID> --task-id T-002-12
 
 ## Token Usage
 
-Typical costs per trajectory:
+Typical costs per trajectory (deterministic assembler is much cheaper than LLM rewriting):
 
 | Stage | Tokens (approx) | Cost (approx) |
 |-------|-----------------|---------------|
-| Classification (Claude) | ~20K input, ~5K output | $0.05 |
-| Rewriting (Claude) | ~150K input, ~50K output | $0.75 |
-| Adversarial Gen (Claude) | ~10K input, ~3K output | $0.04 |
-| Verification (GPT-5.4) | ~100K input, ~5K output | $0.30 |
-| Refix iterations (1-2x) | ~100K additional | $0.50 |
-| **Total per trajectory** | **~400-500K tokens** | **~$1.50-2.00** |
+| Classification (Claude 4.7) | ~10K input, ~500 output | $0.03 |
+| Adversarial Gen (Claude 4.7) | ~300 input, ~200 output | $0.01 |
+| Verification (GPT-5.4) | ~25K input, ~2K output | $0.08 |
+| Assembly (deterministic) | 0 (no LLM) | $0.00 |
+| **Total per trajectory** | **~35K tokens** | **~$0.12** |
 
 ## Output Formats
 
@@ -309,29 +323,30 @@ npm run dev
 ```
 privacy-sft-pipeline/
 ├── run_pipeline.py              # Main CLI orchestrator (Stages 1-6)
-├── parser.py                    # Stage 1: Parse OpenClaw export zips
-├── classifier.py                # Stage 2: Multi-engine PII classification (4 engines)
-├── rewriter.py                  # Stage 3: Claude-based privacy rewriting + adversarial injection
-├── verifier.py                  # Stage 4: GPT-5.4 verification + refix loop
+├── parser.py                    # Stage 1: Parse OpenClaw export zips from GCS
+├── classifier.py                # Stage 2: Multi-engine PII classification with provenance tracking
+├── privacy_registry.py          # Deterministic privacy rule engine (FREE_BAND, provenance, vault)
+├── assembler.py                 # Stage 3: Deterministic trajectory assembly (Claude for adv text only)
+├── verifier.py                  # Stage 4: GPT-5.4 verification (FREE_BAND aware)
 ├── writer.py                    # Stage 5: Output writer (JSONL, SFT, workspace)
 ├── rlhf_generator.py           # Stage 6: RLHF preference pair generation (LLM-based)
 ├── rlhf_data_builder.py        # Stage 6 alt: Production RLHF with DB + personas + jailbreak pairs
 ├── reward_scorer.py             # Process Reward Model (continuous 0-1 scoring via GPT-5.4)
-├── tool_tiers.py                # Tool tier registry (66 tools → T1/T2/T3)
-├── models.py                    # Typed dataclasses for all stages
+├── models.py                    # Typed dataclasses with source provenance fields
 ├── config.py                    # API keys, model config, quality gates
 ├── token_tracker.py             # Token usage tracking and cost estimation
 ├── prompts/
-│   ├── rewriter_system.py       # Claude system prompt (HTG rules, consent flow, adversarial handling)
-│   ├── rewriter_turn.py         # Per-turn user prompt with persona context
-│   ├── verifier_system.py       # GPT-5.4 verification rubric (6 rules + L3/L4 absolute ban)
+│   ├── verifier_system.py       # GPT-5.4 verification rubric (FREE_BAND + 6 rules)
+│   ├── rewriter_system.py       # Legacy Claude rewriter prompt
+│   ├── rewriter_turn.py         # Legacy per-turn prompt
 │   ├── rlhf_system.py           # RLHF rejected alternative generation prompt
 │   ├── rlhf_scorer.py           # Process Reward Model scoring prompt
 │   └── classifier_prompt.py     # PII classification prompt (80+ labels)
 ├── data/
-│   ├── scenarios.json           # Privacy scenario definitions (A-N, 14 scenarios)
 │   ├── classification.json      # PII label → level mapping (80+ labels)
-│   └── tool_tiers.json          # Tool tier reference data (66 tools)
+│   ├── tool_tiers.json          # Tool tier reference (156 tools, cuarena-aligned)
+│   ├── tool_equivalences.json   # T3→T2/T1 tool downgrade map
+│   └── scenarios.json           # Privacy scenario definitions (A-N)
 ├── comparison-ui/
 │   ├── backend/server.py        # FastAPI serving trajectory data
 │   └── frontend/                # React + Vite + Tailwind comparison viewer

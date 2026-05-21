@@ -1,14 +1,24 @@
 {
   "T1": [
-    "read", "write", "exec", "code-analysis", "data-analysis", "debug-pro",
-    "frontend-design", "nextjs-expert", "sql-toolkit", "ui-ux-pro-max",
-    "ffmpeg", "tesseract-ocr", "surya", "openai-whisper", "sherpa-onnx-tts", "video-frames",
+    "read", "write", "exec", "edit", "code", "code-analysis", "code-analysis-skills",
+    "data-analysis", "debug-pro", "frontend-design", "frontend-design-3", "nextjs-expert",
+    "sql-toolkit", "ui-ux-pro-max", "backend-patterns", "api-dev", "devops", "test-runner",
+    "ffmpeg", "ffmpeg-video-editor", "tesseract-ocr", "surya", "openai-whisper",
+    "sherpa-onnx-tts", "video-frames",
     "word-docx", "excel-xlsx", "powerpoint-pptx", "nano-pdf", "markdown-converter",
     "mermaid-diagrams", "excalidraw",
-    "context_window", "context_window_introspection", "memory_search", "self-reflection", "session-logs",
+    "context_window", "context_window_introspection", "memory_search", "self-reflection",
+    "session-logs", "sessions",
     "obsidian", "obsidian-vault-maintainer", "wiki-maintainer", "skill-creator", "skill_workshop",
     "rag_search", "rag_add", "rag_get", "rag_delete", "rag_count", "rag_collections",
-    "vault_get", "vault_set", "vault_list", "vault_delete"
+    "vault_get", "vault_set", "vault_list", "vault_delete",
+    "docker-essentials", "desktop-control", "cron",
+    "agent-team-orchestration", "automation-workflows",
+    "cfo", "habit-tracker", "health", "healthcheck", "humanizer",
+    "language-learning", "linux-native-tools", "marketing-mode", "mcporter", "mechanic",
+    "node-connect", "ontology", "openclaw-native-tools", "productivity",
+    "relationship-skills", "self-improving", "self-improving-agent",
+    "skill-creator", "taskflow", "taskflow-inbox-triage", "workout"
   ],
   "T1_PERSISTENCE": [
     "memory_write", "active_memory_write", "active_memory_set", "wiki_apply"
@@ -24,12 +34,19 @@
     "enterprise-odoo-sales", "enterprise-odoo-website"
   ],
   "T3": [
-    "api-gateway", "browser", "chromium", "web_search", "web_fetch",
-    "gmail", "github", "google-drive", "slack", "notion", "trello",
-    "weather", "flight-search", "stock-analysis",
+    "api-gateway", "browser", "browser-automation", "chromium", "agent-browser",
+    "bundled-web-tools", "web_search", "web_fetch",
+    "gmail", "github", "gh", "gh-issues", "google-drive", "google-docs",
+    "google-sheets", "google-slides", "google-calendar-api", "google-meet", "gog",
+    "slack", "notion", "trello",
+    "weather", "flight-search", "stock-analysis", "news-summary", "polymarket",
+    "openclaw-facebook", "openclaw-instagram", "openclaw-linkedin",
+    "openclaw-reddit", "openclaw-youtube",
     "facebook", "instagram", "linkedin", "reddit", "youtube",
-    "caldav-calendar", "eventbrite", "news-summary", "polymarket",
+    "caldav-calendar", "eventbrite", "goplaces",
     "openrouter-transcribe", "openai-whisper-api", "edge-tts",
-    "clawhub", "skill-hub", "docker.io"
+    "clawhub", "skill-hub", "docker.io",
+    "academic-research", "legaldoc-ai", "music-cog", "moltspaces",
+    "plan2meal", "sudoku"
   ]
 }

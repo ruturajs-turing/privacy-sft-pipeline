@@ -7,7 +7,9 @@ venv/
 
 # Output data (too large for git)
 test_output/
+test_run_output*/
 output/
+test_input.csv
 
 # Keys
 gcs-key.json

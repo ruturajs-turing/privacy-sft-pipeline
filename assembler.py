@@ -18,7 +18,10 @@ import json_repair
 
 from config import ANTHROPIC_API_KEY, REWRITER_MODEL
 from models import AssistantTurn, ParsedTrajectory, PIIEntity, PIIMap, RewriteResult, RewrittenTurn
-from privacy_registry import Action, PrivacyRegistry, TurnDecision, is_persistence_path
+from privacy_registry import (
+    Action, PrivacyRegistry, TurnDecision, is_persistence_path,
+    get_tool_tier, get_lower_tier_equivalent,
+)
 from token_tracker import tracker
 
 logger = logging.getLogger(__name__)
@@ -32,6 +35,81 @@ HATCH_REFUSAL = (
 # PII patterns to strip from memory content
 _NAME_PATTERN = re.compile(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b')
 _EMAIL_PATTERN = re.compile(r'[\w.+-]+@[\w-]+\.[\w.-]+')
+
+
+def _is_valid_tool_call(tc) -> bool:
+    """Validate a tool call has required structure for its type."""
+    if not tc.name or not tc.arguments:
+        return False
+    args = tc.arguments
+    if tc.name == "edit":
+        path = args.get("path", "") or args.get("file_path", "")
+        edits = args.get("edits", [])
+        if not path:
+            return False
+        if not edits or not isinstance(edits, list):
+            return False
+        for e in edits:
+            if not isinstance(e, dict) or (not e.get("oldText") and not e.get("newText")):
+                return False
+        return True
+    if tc.name == "write":
+        return bool(args.get("path") or args.get("file_path")) and bool(args.get("content"))
+    if tc.name == "read":
+        return bool(args.get("path") or args.get("file_path"))
+    # For other tools, just require non-empty arguments
+    return True
+
+
+def _strip_names_from_args(args: dict, pii_entities: list[PIIEntity]) -> dict:
+    """Strip persona names from tool call arguments (writes, edits, and search queries).
+
+    HTG Rule 2 (minimization) applies to ALL persisted files, not just memory paths.
+    Also cleans search queries that contain persona names.
+    """
+    name_entities = [e for e in pii_entities if e.label == "ID_FULL_NAME"]
+    if not name_entities:
+        return args
+
+    def strip_names(text: str) -> str:
+        result = text
+        for entity in name_entities:
+            result = result.replace(entity.text, "the user")
+            # Also strip first name alone in various patterns
+            parts = entity.text.split()
+            if parts and len(parts[0]) > 2:
+                first = parts[0]
+                result = re.sub(r'\b' + re.escape(first) + r"'s\b", "the user's", result)
+                result = re.sub(r'\(' + re.escape(first) + r'\s', '(the user ', result)
+                result = re.sub(r'\b' + re.escape(first) + r'\b', 'the user', result)
+            if len(parts) > 1 and len(parts[-1]) > 2:
+                last = parts[-1]
+                result = re.sub(r'\b' + re.escape(last) + r'\b', '', result)
+        # Fix "About [Name]" headers
+        result = re.sub(r'## About [A-Z][a-z]+(?:\s+[A-Z][a-z]+)*', '## About the user', result)
+        # Fix "for [Name]" patterns
+        result = re.sub(
+            r'\bfor ([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b',
+            lambda m: 'for the user' if m.group(1).lower() not in (
+                'south korea', 'north america', 'new york', 'google doc'
+            ) else m.group(0), result
+        )
+        return result
+
+    result = copy.deepcopy(args)
+    if "content" in result and isinstance(result["content"], str):
+        result["content"] = strip_names(result["content"])
+    if "edits" in result and isinstance(result["edits"], list):
+        for edit in result["edits"]:
+            if isinstance(edit, dict):
+                if "newText" in edit:
+                    edit["newText"] = strip_names(edit["newText"])
+                if "oldText" in edit:
+                    edit["oldText"] = strip_names(edit["oldText"])
+    # Strip from search queries too
+    if "query" in result and isinstance(result["query"], str):
+        result["query"] = strip_names(result["query"])
+    return result
 
 
 def _minimize_content(content: str, pii_entities: list[PIIEntity], strip_names: bool = True) -> str:
@@ -102,10 +180,25 @@ def _minimize_content(content: str, pii_entities: list[PIIEntity], strip_names: 
     return result.strip()
 
 
-def _generate_thinking(decision: TurnDecision, turn: AssistantTurn) -> str:
-    """Generate a deterministic thinking block based on the registry decision."""
+def _generate_thinking(decision: TurnDecision, turn: AssistantTurn, pii_map: PIIMap | None = None) -> str:
+    """Generate a deterministic thinking block based on the registry decision.
+    
+    For text-only/read-only turns, we scan the original text for PII to report
+    accurate data level in the thinking block (avoids verifier "misclassification" flags).
+    """
     tool_names = [tc.name for tc in turn.tool_calls] if turn.tool_calls else ["(text only)"]
     pii_desc = ", ".join(f"{e.text[:20]}→{e.label}({e.level})" for e in decision.pii_in_content[:5])
+
+    # For text-only turns, check the text content for PII to report accurate level
+    effective_level = decision.data_level
+    if not decision.pii_in_content and pii_map and turn.text_blocks:
+        from privacy_registry import _LEVEL_ORDER, _max_pii_level_in_content
+        text_content = " ".join(turn.text_blocks)
+        text_level, text_pii = _max_pii_level_in_content(text_content, pii_map.entities)
+        if _LEVEL_ORDER.get(text_level, 0) > _LEVEL_ORDER.get(effective_level, 0):
+            effective_level = text_level
+            pii_desc = ", ".join(f"{e.text[:20]}→{e.label}({e.level})" for e in text_pii[:5])
+
     if not pii_desc:
         pii_desc = "no PII in this operation"
 
@@ -116,11 +209,13 @@ def _generate_thinking(decision: TurnDecision, turn: AssistantTurn) -> str:
         tier_label = "T1 (local)" if all(t == "T1" for t in tiers_found) else \
                      "T3 (external)" if any(t == "T3" for t in tiers_found) else \
                      "T2 (first-party cloud)" if any(t == "T2" for t in tiers_found) else "T1 (local)"
+        is_display_only = not turn.tool_calls or decision.is_read_only
+        gate_note = "display only, no persistence" if is_display_only else "within bounds, no sensitive data persisted"
         return (
-            f"Step 1 — Classify: data level = {decision.data_level}. PII in this operation: {pii_desc}. "
-            f"Step 2 — Provenance: N/A (level < L3). "
+            f"Step 1 — Classify: data level = {effective_level}. PII: {pii_desc}. "
+            f"Step 2 — Provenance: not applicable at this sensitivity level. "
             f"Step 3 — Tool selection: [{', '.join(tool_names)}] = {tier_label}. "
-            f"Step 4 — Gate: {tier_label} + {decision.data_level} → Gate 4d ALLOW (within bounds). "
+            f"Step 4 — Gate: {tier_label} + {effective_level} → ALLOW ({gate_note}). "
             f"Step 5 — Execute. Proceeding."
         )
     elif decision.action == Action.MINIMIZE:
@@ -157,13 +252,31 @@ def _generate_thinking(decision: TurnDecision, turn: AssistantTurn) -> str:
             f"Gate 4c: {decision.data_level} data cannot be sent to T3 tool ({decision.target_path}) "
             f"without consent. Blocking or requesting T1 alternative."
         )
+    elif decision.action == Action.ELICIT:
+        return (
+            f"Step 1 — Classify: data level = {decision.data_level}. PII: {pii_desc}. "
+            f"Step 2 — Provenance: STALE. L3/L4 data does NOT come from the current user turn "
+            f"or a preceding confirmation step — it originates from memory/history. "
+            f"Amnesia rule applies: I cannot use this data. Must ask the user to re-provide it."
+        )
+    elif decision.action == Action.VAULT_REDIRECT:
+        return (
+            f"Step 1 — Classify: data level = {decision.data_level}. PII: {pii_desc}. "
+            f"Step 2 — Provenance: from current conversation. "
+            f"Step 3 — Tool: [{', '.join(tool_names)}] targeting persistence ({decision.target_path.split('/')[-1]}). "
+            f"Step 4 — Gate 4a: T1_PERSISTENCE + {decision.data_level} → HARD DENY for plain memory. "
+            f"However, this data is reused later. Remediation: redirect to encrypted vault "
+            f"(vault_set '{decision.vault_key}') instead of plaintext memory. "
+            f"Subsequent reads will use vault_get."
+        )
     return f"Turn {decision.turn_index}: {decision.reason}"
 
 
 def _generate_consent_question(turn: AssistantTurn, decision: TurnDecision) -> str:
     """Generate a natural consent question for a persistence write.
 
-    HTG Rule 3 requires disclosure of: data classification, tool/path, sensitivity level.
+    HTG Rule 3 requires disclosure of: data classification, tool/path, sensitivity level,
+    specific rule reference, and alternatives.
     """
     path = decision.target_path
     if "memory.md" in path.lower():
@@ -177,15 +290,18 @@ def _generate_consent_question(turn: AssistantTurn, decision: TurnDecision) -> s
 
     pii_mention = "project details and preferences"
     if decision.data_level == "L2":
-        pii_mention = "some personal details (like your training schedule and preferences — classified as L2 sensitive data)"
+        pii_mention = "some personal details (training schedule, city, preferences — classified as L2 under HTG)"
 
     questions = [
-        f"Before I write to {target_desc} — this is a persistent record that future sessions can access. "
-        f"The data includes {pii_mention}. "
-        f"I'd be using the local `write` tool to save it. Want me to go ahead?",
+        f"Before I write to {target_desc} — under HTG Rule 3, I need your explicit consent "
+        f"before persisting {decision.data_level} data. The data includes {pii_mention}. "
+        f"I'd use the local `write` tool (T1, stays on your machine). "
+        f"Alternatively, I can skip saving and just keep this in our current session. "
+        f"Want me to go ahead and save it?",
         f"I'd like to save a project summary to {target_desc}. "
-        f"This would persist {pii_mention} across sessions via local file write. "
-        f"Is that okay with you?",
+        f"HTG Rule 3 requires me to ask before persisting {decision.data_level}-classified data "
+        f"(your {pii_mention}). This uses local file write (T1) — nothing leaves your machine. "
+        f"I can also skip this if you'd rather not persist anything. Your call?",
     ]
     return random.choice(questions)
 
@@ -242,7 +358,8 @@ def _condense_for_memory(content: str) -> str:
 
     # Section headers to skip entirely (and their content)
     SKIP_SECTION_KEYWORDS = (
-        'session log', 'setup notes', 'tools &',
+        'session log', 'setup notes', 'tools &', 'research basis',
+        'key numbers', 'supplement',
     )
 
     for line in lines:
@@ -296,6 +413,8 @@ def _build_minimized_tool_calls(
     """Build tool calls with minimized content (PII stripped from write payloads)."""
     result = []
     for tc in turn.tool_calls:
+        if not _is_valid_tool_call(tc):
+            continue
         tc_dict = {"id": tc.call_id, "name": tc.name, "arguments": copy.deepcopy(tc.arguments)}
         path = tc.arguments.get("path", "") or tc.arguments.get("file_path", "") or ""
 
@@ -338,16 +457,25 @@ def _build_minimized_tool_calls(
     return result
 
 
-def _build_tool_results(turn: AssistantTurn, trajectory: ParsedTrajectory) -> list[dict]:
-    """Copy original tool results for this turn."""
+def _build_tool_results(turn: AssistantTurn, trajectory: ParsedTrajectory, pii_entities: list[PIIEntity] | None = None) -> list[dict]:
+    """Copy original tool results for this turn, stripping names from persistence results."""
     results = []
+    name_entities = [e for e in (pii_entities or []) if e.label == "ID_FULL_NAME"]
     for tc in turn.tool_calls:
         if tc.call_id in trajectory.tool_results_by_call_id:
             tr = trajectory.tool_results_by_call_id[tc.call_id]
+            content = tr.content[:2000]
+            # Strip names from tool results for write/edit confirmations
+            if name_entities and tc.name in ("write", "edit", "memory_write"):
+                for ne in name_entities:
+                    content = content.replace(ne.text, "the user")
+                    parts = ne.text.split()
+                    if parts and len(parts[0]) > 2:
+                        content = content.replace(parts[0], "the user")
             results.append({
                 "call_id": tr.call_id,
                 "tool_name": tr.tool_name or tc.name,
-                "content": tr.content[:2000],
+                "content": content,
                 "is_error": tr.is_error,
             })
     return results
@@ -459,21 +587,74 @@ async def assemble_trajectory(
 
     for turn, decision in zip(trajectory.assistant_turns, decisions):
         original_text = "\n".join(turn.text_blocks) if turn.text_blocks else ""
-        original_results = _build_tool_results(turn, trajectory)
+        # Strip sentinel/placeholder strings from original text
+        if original_text.strip() in ("NO_REPLY", "NO REPLY", "[NO REPLY]", ""):
+            original_text = ""
+        # Strip persona names from all assistant text (Rule 2 minimization)
+        name_entities = [e for e in pii_map.entities if e.label == "ID_FULL_NAME"]
+        for ne in name_entities:
+            original_text = original_text.replace(ne.text, "the user")
+            parts = ne.text.split()
+            if parts and len(parts[0]) > 2:
+                original_text = re.sub(r'\b' + re.escape(parts[0]) + r"'s\b", "the user's", original_text)
+                original_text = re.sub(r'\b' + re.escape(parts[0]) + r'\b', 'the user', original_text)
+
+        original_results = _build_tool_results(turn, trajectory, pii_map.entities)
 
         if decision.action == Action.ALLOW:
-            # Pass through with thinking block added
-            tool_calls = [
-                {"id": tc.call_id, "name": tc.name, "arguments": copy.deepcopy(tc.arguments)}
-                for tc in turn.tool_calls
-            ]
+            # Validate original text — remove claims about actions not in tool_calls
+            if not turn.tool_calls:
+                _misleading = (
+                    "saved it", "deleted it", "wrote it", "stored it",
+                    "saved to", "deleted from", "removed it",
+                )
+                if any(m in original_text.lower() for m in _misleading):
+                    original_text = ""
+
+            # Pass through with thinking block added — validate tool calls
+            tool_calls = []
+            valid_results = []
+            for tc in turn.tool_calls:
+                if not _is_valid_tool_call(tc):
+                    continue
+                tc_dict = {"id": tc.call_id, "name": tc.name, "arguments": copy.deepcopy(tc.arguments)}
+
+                # P1: Tool tier downgrade — swap tool name if decision says so
+                if decision.downgraded_tool and tc.name == decision.original_tool:
+                    tc_dict["name"] = decision.downgraded_tool
+
+                # Strip persona names from ALL tool arguments (Rule 2 minimization)
+                if tc_dict["name"] in ("write", "edit", "memory_search", "memory_write"):
+                    tc_dict["arguments"] = _strip_names_from_args(
+                        tc_dict["arguments"], pii_map.entities
+                    )
+
+                tool_calls.append(tc_dict)
+                # Only include results for valid calls
+                if tc.call_id in trajectory.tool_results_by_call_id:
+                    tr = trajectory.tool_results_by_call_id[tc.call_id]
+                    if not tr.is_error:
+                        valid_results.append({
+                            "call_id": tr.call_id,
+                            "tool_name": tc_dict["name"],
+                            "content": tr.content[:2000],
+                            "is_error": tr.is_error,
+                        })
+
+            # Skip turns with no valid tool calls and no text
+            if not tool_calls and not original_text.strip():
+                continue
+
+            actions = ["classify"]
+            if decision.downgraded_tool:
+                actions.append("tool_downgrade")
             rewritten_turns.append(RewrittenTurn(
                 turn_index=turn.turn_index,
-                thinking=_generate_thinking(decision, turn),
+                thinking=_generate_thinking(decision, turn, pii_map),
                 text=original_text,
                 tool_calls=tool_calls,
-                tool_results=original_results,
-                privacy_actions=["classify"],
+                tool_results=valid_results if tool_calls else [],
+                privacy_actions=actions,
                 scenario="A",
             ))
 
@@ -484,7 +665,7 @@ async def assemble_trajectory(
             )
             rewritten_turns.append(RewrittenTurn(
                 turn_index=turn.turn_index,
-                thinking=_generate_thinking(decision, turn),
+                thinking=_generate_thinking(decision, turn, pii_map),
                 text=original_text,
                 tool_calls=tool_calls,
                 tool_results=original_results,
@@ -498,19 +679,17 @@ async def assemble_trajectory(
             # Turn B: synthetic user responds + assistant executes
 
             consent_question = _generate_consent_question(turn, decision)
-            # For the first consent gate, always grant (user just asked to save).
-            # For subsequent gates, vary slightly.
-            if not consent_given_for:
-                consent_decision = "granted"
-            else:
-                consent_decision = "granted" if random.random() > 0.2 else "partial"
+            # Always grant consent for memory writes — the user explicitly asked
+            # to save project data. Partial consent creates verification complexity
+            # and is better reserved for RLHF pair generation (rejected alternatives).
+            consent_decision = "granted"
 
             user_response = _generate_consent_response(persona, consent_decision)
 
             # Gate turn (asks permission)
             gate_turn = RewrittenTurn(
                 turn_index=turn.turn_index,
-                thinking=_generate_thinking(decision, turn),
+                thinking=_generate_thinking(decision, turn, pii_map),
                 text=consent_question,
                 tool_calls=[],
                 tool_results=[],
@@ -523,8 +702,9 @@ async def assemble_trajectory(
             exec_tool_calls = _build_minimized_tool_calls(
                 turn, decision, pii_map.entities, consent_decision
             )
-            ack_text = "Done — saved a project summary to memory for next time." if consent_decision == "granted" else \
-                       "Got it — saved just the project structure, left out personal details." if consent_decision == "partial" else \
+            # Text should not claim completion before tool executes — use prospective phrasing
+            ack_text = "" if consent_decision == "granted" else \
+                       "" if consent_decision == "partial" else \
                        "No problem, I won't save that."
 
             exec_thinking = (
@@ -538,10 +718,14 @@ async def assemble_trajectory(
             else:
                 exec_thinking += "Step 5 — Abort: user denied persistence. No write executed."
 
+            # For execution turn: never use original text (may claim wrong things)
+            # Use a brief, accurate acknowledgment or nothing
+            exec_text = ack_text
+
             exec_turn = RewrittenTurn(
                 turn_index=turn.turn_index,
                 thinking=exec_thinking,
-                text=ack_text if not original_text else original_text,
+                text=exec_text,
                 tool_calls=exec_tool_calls if consent_decision != "denied" else [],
                 tool_results=original_results if consent_decision != "denied" else [],
                 privacy_actions=["classify", f"consent_{consent_decision}"],
@@ -554,27 +738,97 @@ async def assemble_trajectory(
             consent_given_for.add(decision.consent_path)
 
         elif decision.action == Action.HARD_DENY:
-            # Replace tool calls with Hatch refusal
             refusal_text = (
                 f"I appreciate you wanting to save that, but {HATCH_REFUSAL} "
                 f"I can still use this information for your current task — "
                 f"just not persist it across sessions."
             )
+            if decision.remediation == "manual_input":
+                refusal_text += (
+                    " When you need this data in a future session, just share it "
+                    "with me again and I'll use it immediately."
+                )
+            elif decision.remediation == "exception_md":
+                # Exception.md flow: deny persistence, then offer the documented
+                # exception path — user must edit exception.md to explicitly
+                # acknowledge the risk before a retry can succeed.
+                refusal_text += (
+                    "\n\nIf you need this data persisted across sessions because "
+                    "your workflow depends heavily on it, you can create a documented "
+                    "exception by adding an entry to `exception.md` in your workspace. "
+                    "The entry should describe why the exception is needed and what "
+                    "risk you're accepting. On the next attempt, I'll check for the "
+                    "documented exception before proceeding."
+                )
+
             rewritten_turns.append(RewrittenTurn(
                 turn_index=turn.turn_index,
-                thinking=_generate_thinking(decision, turn),
+                thinking=_generate_thinking(decision, turn, pii_map),
                 text=refusal_text,
                 tool_calls=[],
                 tool_results=[],
-                privacy_actions=["classify", "hard_deny"],
+                privacy_actions=["classify", "hard_deny"] + (
+                    ["exception_md_offered"] if decision.remediation == "exception_md" else []
+                ),
                 scenario="D",
+            ))
+
+        elif decision.action == Action.VAULT_REDIRECT:
+            # Instead of denying, redirect the write to vault_set
+            vault_key = decision.vault_key or "user_data"
+            vault_tool_call = {
+                "id": f"vault_{turn.turn_index}",
+                "name": "vault_set",
+                "arguments": {
+                    "key": vault_key,
+                    "value": "[VAULT-ENCRYPTED]",
+                },
+            }
+            vault_result = {
+                "call_id": f"vault_{turn.turn_index}",
+                "tool_name": "vault_set",
+                "content": f"Stored '{vault_key}' in encrypted vault.",
+                "is_error": False,
+            }
+            explanation = (
+                f"I can't save {decision.data_level}-level data to plaintext memory, "
+                f"but since you'll need it later, I've stored it in your encrypted vault "
+                f"under the key `{vault_key}`. Future reads will use `vault_get` instead."
+            )
+            rewritten_turns.append(RewrittenTurn(
+                turn_index=turn.turn_index,
+                thinking=_generate_thinking(decision, turn, pii_map),
+                text=explanation,
+                tool_calls=[vault_tool_call],
+                tool_results=[vault_result],
+                privacy_actions=["classify", "vault_redirect"],
+                scenario="D",
+            ))
+
+        elif decision.action == Action.ELICIT:
+            # L3/L4 data from stale source — ask user to re-provide
+            pii_labels = ", ".join(set(e.label for e in decision.pii_in_content[:5]))
+            elicit_text = (
+                f"I need some information to proceed, but I can't pull {decision.data_level}-level data "
+                f"from memory or prior context — per HTG, I need you to provide it directly "
+                f"in this conversation. Could you share the relevant details "
+                f"({pii_labels}) again so I can use them for this task?"
+            )
+            rewritten_turns.append(RewrittenTurn(
+                turn_index=turn.turn_index,
+                thinking=_generate_thinking(decision, turn, pii_map),
+                text=elicit_text,
+                tool_calls=[],
+                tool_results=[],
+                privacy_actions=["classify", "elicit"],
+                scenario="E",
             ))
 
         elif decision.action == Action.T3_BLOCK:
             # Block T3 tool call, suggest T1 alternative
             rewritten_turns.append(RewrittenTurn(
                 turn_index=turn.turn_index,
-                thinking=_generate_thinking(decision, turn),
+                thinking=_generate_thinking(decision, turn, pii_map),
                 text=f"I'll handle this locally instead of sending data externally. {original_text}",
                 tool_calls=[],
                 tool_results=[],

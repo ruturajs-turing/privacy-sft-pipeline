@@ -68,6 +68,8 @@ class PIIEntity:
     turn_index: int = -1
     engines: list[str] = field(default_factory=list)
     confidence: float = 1.0
+    source_turn_index: int = -1  # which turn introduced this PII (-1 = unknown)
+    source_type: str = ""  # "user_input", "tool_result", "memory_read", "history"
 
 
 @dataclass

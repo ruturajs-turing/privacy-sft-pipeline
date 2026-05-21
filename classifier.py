@@ -194,7 +194,7 @@ async def _run_openai_filter(text: str) -> list[PIIEntity]:
 # Claude LLM Classifier (fine-grained taxonomy from Classification.md)
 # ---------------------------------------------------------------------------
 
-_CLASSIFIER_PROMPT = """You are a highly accurate PII classifier for a privacy-compliance pipeline. Analyze the text and identify ALL personally identifiable information with precise classification.
+_CLASSIFIER_PROMPT = """You are a highly accurate PII classifier for the OpenClaw Privacy pipeline, aligned with the Hatch Trust Guidelines (HTG) 5-level data taxonomy.
 
 For each PII item found, output a JSON array of objects:
 {{"text": "<exact text found in the input>", "label": "<LABEL_FROM_TAXONOMY>", "level": "<L0|L1|L2|L3|L4>"}}
@@ -202,22 +202,25 @@ For each PII item found, output a JSON array of objects:
 ## TAXONOMY (label → level):
 {taxonomy}
 
-## CRITICAL CLASSIFICATION RULES:
+## CRITICAL CLASSIFICATION RULES (aligned with HTG + cuarena-pipeline):
 
 1. **Be exhaustive** — find EVERY piece of PII in the text
 2. **Exact text only** — the "text" field must be a verbatim substring from the input
 3. **Most specific label** — if text matches multiple labels, use the most specific
 4. **References vs. Values**:
-   - A LOG ENTRY like "API key saved to TOOLS.md" or "sent email to X" is METADATA (L1 COMM_TIMESTAMP or L0 PUB_GENERAL_KNOWLEDGE), NOT the credential itself
-   - An ACTUAL credential value like "sk-ant-api03-..." or "password123" is AUTH_API_KEY/AUTH_PASSWORD (L4)
+   - A LOG ENTRY like "API key saved to TOOLS.md" is METADATA (L1), NOT the credential itself
+   - An ACTUAL credential value like "sk-ant-api03-..." is AUTH_API_KEY (L4)
    - "Maton API key" as a reference/mention = L1 metadata. The actual key string = L4.
-5. **Health data precision**:
+5. **Session tokens are L1** (not L3): short-lived JWTs, session cookies, bearer tokens with short TTL = AUTH_SESSION_TOKEN (L1). Only long-lived refresh tokens = AUTH_OAUTH_REFRESH (L4).
+6. **Health data precision**:
    - Diagnosis names (GAD, ADHD, diabetes, anxiety) = HEALTH_MENTAL_HEALTH or HEALTH_DIAGNOSIS (L3)
    - Insurance ID numbers (UHC-883-...) = HEALTH_INSURANCE_ID (L2)
    - Vital signs (65kg, BMI, heart rate) = HEALTH_VITAL (L1)
-6. **Names**: Full names = ID_FULL_NAME (L2). First name alone in context = ID_FULL_NAME (L2) only if clearly a person's name
-7. **Locations**: City names = LOC_GPS_CITY (L1). Street addresses = LOC_STREET_ADDR (L2). Home address = LOC_HOME_ADDR (L3)
-8. **Behavioral data**: Aggregated habits (e.g., "trains 3x/week") = BEHAV_AGGREGATE (L1)
+7. **Names**: Full names = ID_FULL_NAME (L2). First name alone in context = ID_FULL_NAME (L2) only if clearly a person's name
+8. **Locations**: City names = LOC_GPS_CITY (L1). Street addresses = LOC_STREET_ADDR (L2). Home address = LOC_HOME_ADDR (L3). Country/region only = LOC_COUNTRY/LOC_REGION (L0).
+9. **Behavioral data**: Aggregated habits (e.g., "trains 3x/week") = BEHAV_AGGREGATE (L1). NOT L2 unless tied to purchase/browse history.
+10. **Cuisine/nationality words** (Korean, Japanese, Italian) in food context = PUB_GENERAL_KNOWLEDGE (L0), NOT DEMO_ETHNICITY (L3). Only classify as DEMO_ETHNICITY when explicitly describing a person's racial/ethnic origin tied to their identity.
+11. **Gender** (male/female) tied to a specific person = DEMO_GENDER (L2). Generic category references ("women's health") = PUB_GENERAL_KNOWLEDGE (L0).
 
 {persona_context}
 
@@ -302,10 +305,24 @@ async def _run_llm_classifier(text: str, persona: dict | None = None) -> list[PI
 
         # Post-process: downgrade log references that aren't actual secret values
         if label == "AUTH_API_KEY" and level == "L4":
-            # If it's a reference like "API key saved to X" rather than an actual key value
             if "saved to" in text_val or "stored in" in text_val or len(text_val) > 50:
                 level = "L1"
-                label = "COMM_TIMESTAMP"  # It's a log/metadata entry
+                label = "COMM_TIMESTAMP"
+
+        # Post-process: cuisine/nationality words are NOT ethnicity identifiers
+        # "Korean food", "Korean pancakes", "Japanese", "Asian" in food context = L0/L1
+        if label in ("DEMO_ETHNICITY", "DEMO_RACE") and text_val.lower() in (
+            "korean", "japanese", "chinese", "asian", "thai", "italian",
+            "french", "mexican", "indian", "vietnamese", "american",
+        ):
+            level = "L0"
+            label = "PUB_GENERAL_KNOWLEDGE"
+
+        # Gender is L2 per official rules — only downgrade truly generic/aggregate usage
+        # (e.g., "women's health tips" as a category, not tied to a person)
+        if label == "DEMO_GENDER" and text_val.lower() in ("women", "men"):
+            level = "L0"
+            label = "PUB_GENERAL_KNOWLEDGE"
 
         # Enforce taxonomy level (don't let LLM override the classification map)
         canonical_level = classification.get(label)
@@ -464,22 +481,58 @@ def _merge_entities(all_entities: list[PIIEntity]) -> list[PIIEntity]:
 # Public API
 # ---------------------------------------------------------------------------
 
-async def classify_trajectory(trajectory: ParsedTrajectory) -> PIIMap:
-    """Run multi-engine PII detection on a full trajectory."""
-    all_text_blocks = []
+def _classify_source(entity: PIIEntity, turn_index: int, source_type: str) -> PIIEntity:
+    """Stamp provenance fields onto an entity."""
+    entity.source_turn_index = turn_index
+    entity.source_type = source_type
+    return entity
 
-    # Gather all text from user messages and assistant turns
-    for msg in trajectory.user_messages:
-        all_text_blocks.append(msg)
+
+def _determine_source_type(tool_name: str | None, is_user_msg: bool) -> str:
+    """Map where text originated to a provenance category."""
+    if is_user_msg:
+        return "user_input"
+    if not tool_name:
+        return "assistant_text"
+    memory_read_tools = {"memory_search", "rag_search", "vault_get", "vault_list"}
+    if tool_name in memory_read_tools:
+        return "memory_read"
+    return "tool_result"
+
+
+async def classify_trajectory(trajectory: ParsedTrajectory) -> PIIMap:
+    """Run multi-engine PII detection with per-argument provenance tracking.
+
+    Each detected entity gets stamped with:
+    - source_turn_index: which turn introduced this PII
+    - source_type: "user_input" | "tool_result" | "memory_read" | "assistant_text"
+    """
+    # Build text segments with provenance metadata
+    segments: list[tuple[str, int, str]] = []  # (text, turn_index, source_type)
+
+    for i, msg in enumerate(trajectory.user_messages):
+        segments.append((msg, i, "user_input"))
+
     for turn in trajectory.assistant_turns:
         for tb in turn.text_blocks:
-            all_text_blocks.append(tb)
-        for tc in turn.tool_calls:
-            args_str = json.dumps(tc.arguments) if tc.arguments else ""
-            if args_str:
-                all_text_blocks.append(args_str)
+            segments.append((tb, turn.turn_index, "assistant_text"))
 
-    full_text = "\n---\n".join(all_text_blocks)
+        for tc in turn.tool_calls:
+            for arg_key, arg_val in tc.arguments.items():
+                arg_text = arg_val if isinstance(arg_val, str) else json.dumps(arg_val)
+                if arg_text and len(arg_text) > 3:
+                    src = _determine_source_type(tc.name, False)
+                    segments.append((arg_text, turn.turn_index, src))
+
+        for tc in turn.tool_calls:
+            if tc.call_id in trajectory.tool_results_by_call_id:
+                tr = trajectory.tool_results_by_call_id[tc.call_id]
+                if tr.content:
+                    src = _determine_source_type(tc.name, False)
+                    segments.append((tr.content[:4000], turn.turn_index, src))
+
+    # Concatenate for bulk classification (engines work best on large text)
+    full_text = "\n---\n".join(seg[0] for seg in segments)
 
     # Run engines in parallel
     presidio_task = asyncio.get_event_loop().run_in_executor(None, _run_presidio, full_text)
@@ -496,11 +549,26 @@ async def classify_trajectory(trajectory: ParsedTrajectory) -> PIIMap:
         elif isinstance(r, Exception):
             logger.warning("Engine failed: %s", r)
 
-    # Always run pattern classifier as fallback (persona-aware, no API needed)
     pattern_entities = _run_pattern_classifier(full_text, trajectory.persona)
     all_entities.extend(pattern_entities)
 
     merged = _merge_entities(all_entities)
+
+    # Stamp provenance: for each merged entity, find its earliest source segment
+    for entity in merged:
+        entity_lower = entity.text.lower()
+        earliest_turn = 999
+        earliest_source = "history"
+        for seg_text, seg_turn, seg_source in segments:
+            if entity_lower in seg_text.lower() and seg_turn < earliest_turn:
+                earliest_turn = seg_turn
+                earliest_source = seg_source
+        if earliest_turn < 999:
+            entity.source_turn_index = earliest_turn
+            entity.source_type = earliest_source
+        else:
+            entity.source_turn_index = -1
+            entity.source_type = "history"
 
     # Compute summary
     max_level = "L0"

@@ -17,8 +17,8 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 GOOGLE_APPLICATION_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
 
 # Models
-REWRITER_MODEL = "claude-opus-4-6"
-CLASSIFIER_MODEL = "claude-opus-4-6"
+REWRITER_MODEL = "claude-opus-4-7"
+CLASSIFIER_MODEL = "claude-opus-4-7"
 VERIFIER_MODEL = "gpt-5.4"
 
 # Concurrency

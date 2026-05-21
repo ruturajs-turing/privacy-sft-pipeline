@@ -68,12 +68,16 @@ def _turn_to_jsonl_events(
     events = []
     ts = base_ts + (turn.turn_index * 5000)
 
-    # Build content blocks
+    # Build content blocks — tool calls go before text when both present
+    # (prevents "claims action before executing" sequencing issues)
     content = []
     if turn.thinking:
         content.append({"type": "thinking", "thinking": turn.thinking})
-    if turn.text:
+
+    has_tool_calls = any(isinstance(tc, dict) for tc in turn.tool_calls)
+    if turn.text and not has_tool_calls:
         content.append({"type": "text", "text": turn.text})
+
     for tc in turn.tool_calls:
         if isinstance(tc, dict):
             content.append({
@@ -82,6 +86,10 @@ def _turn_to_jsonl_events(
                 "name": tc.get("name", ""),
                 "arguments": tc.get("arguments", {}),
             })
+
+    # Text after tool calls (for turns that execute tools then confirm)
+    if turn.text and has_tool_calls:
+        content.append({"type": "text", "text": turn.text})
 
     # Assistant message event
     msg_data: dict = {
@@ -147,20 +155,27 @@ def write_trajectory_output(
 
     # Emit events in thread order
     emitted_user_msgs: set[int] = set()
+    last_emitted_role = None
+
     for rt in rewrite_result.turns:
         # Emit the original user message preceding this turn (only once per turn_index)
+        # BUT skip if a synthetic user message will immediately follow (prevents consecutive user msgs)
         if rt.turn_index in user_before_turn and rt.turn_index not in emitted_user_msgs:
-            u_idx = user_before_turn[rt.turn_index]
-            if u_idx < len(trajectory.user_messages):
-                jsonl_events.append({
-                    "type": "message",
-                    "id": _generate_event_id(),
-                    "message": {
-                        "role": "user",
-                        "content": [{"type": "text", "text": trajectory.user_messages[u_idx]}],
-                        "timestamp": base_ts + (rt.turn_index * 5000) - 1000,
-                    }
-                })
+            # Don't emit user message if this turn has a synthetic user message
+            # (it would create user→user sequence)
+            if not rt.synthetic_user_message:
+                u_idx = user_before_turn[rt.turn_index]
+                if u_idx < len(trajectory.user_messages):
+                    jsonl_events.append({
+                        "type": "message",
+                        "id": _generate_event_id(),
+                        "message": {
+                            "role": "user",
+                            "content": [{"type": "text", "text": trajectory.user_messages[u_idx]}],
+                            "timestamp": base_ts + (rt.turn_index * 5000) - 1000,
+                        }
+                    })
+                    last_emitted_role = "user"
             emitted_user_msgs.add(rt.turn_index)
 
         # If this is an adversarial turn, emit the adversarial user message BEFORE the refusal
@@ -179,6 +194,7 @@ def write_trajectory_output(
                     },
                 }
             })
+            last_emitted_role = "user"
 
         # If this turn has a synthetic user message (consent flow response),
         # emit it BEFORE the assistant's execution message
