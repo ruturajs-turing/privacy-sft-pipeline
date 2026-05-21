@@ -6,7 +6,7 @@ Multi-stage pipeline that converts OpenClaw agent trajectories into privacy-comp
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                        Privacy SFT Pipeline                                  │
+│                        Privacy SFT Pipeline                                 │
 ├──────────┬──────────┬──────────┬──────────┬──────────┬──────────────────────┤
 │ Stage 1  │ Stage 2  │ Stage 3  │ Stage 4  │ Stage 5  │ Stage 6              │
 │ Parse    │ Classify │ Rewrite  │ Verify   │ Write    │ RLHF                 │

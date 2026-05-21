@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import random
@@ -26,6 +27,94 @@ def _get_semaphore() -> asyncio.Semaphore:
     if _semaphore is None:
         _semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
     return _semaphore
+
+
+def _is_valid_edit_args(args: object) -> bool:
+    """Require path + non-empty edits list of {oldText, newText} dicts (strings)."""
+    if not isinstance(args, dict):
+        return False
+    if not isinstance(args.get("path"), str) or not args["path"].strip():
+        return False
+    edits = args.get("edits")
+    if not isinstance(edits, list) or len(edits) == 0:
+        return False
+    for e in edits:
+        if not isinstance(e, dict):
+            return False
+        if "oldText" not in e or "newText" not in e:
+            return False
+        if not isinstance(e["oldText"], str) or not isinstance(e["newText"], str):
+            return False
+    return True
+
+
+def _is_valid_write_args(args: object) -> bool:
+    if not isinstance(args, dict):
+        return False
+    path = args.get("file_path") or args.get("path")
+    if not isinstance(path, str) or not path.strip():
+        return False
+    if "content" not in args or not isinstance(args.get("content"), str):
+        return False
+    return True
+
+
+def _repair_tool_calls_from_original(
+    original_turn: AssistantTurn,
+    tool_calls: list | None,
+) -> tuple[list[dict], list[dict]]:
+    """If Claude mangled edit/write JSON, restore arguments from the original turn (same id or index).
+
+    Returns (repaired_tool_calls, repair_log) where each log entry has tool, reason, call_id.
+    """
+    if not tool_calls:
+        return [], []
+
+    orig_list = list(original_turn.tool_calls)
+    orig_by_id = {tc.call_id: tc for tc in orig_list if getattr(tc, "call_id", None)}
+    out: list[dict] = []
+    log: list[dict] = []
+
+    for i, d in enumerate(tool_calls):
+        if not isinstance(d, dict):
+            continue
+        name = d.get("name", "") or ""
+        args = d.get("arguments")
+        if not isinstance(args, dict):
+            args = {}
+        cid = d.get("id") or d.get("call_id") or ""
+
+        otc = None
+        if cid and cid in orig_by_id and orig_by_id[cid].name == name:
+            otc = orig_by_id[cid]
+        elif i < len(orig_list) and orig_list[i].name == name:
+            otc = orig_list[i]
+
+        new_d = copy.deepcopy(d)
+        if otc is None:
+            out.append(new_d)
+            continue
+
+        reason = ""
+        if name == "edit" and not _is_valid_edit_args(args):
+            new_d["arguments"] = copy.deepcopy(otc.arguments)
+            reason = "invalid_edit_args_restored_from_original"
+        elif name == "write" and not _is_valid_write_args(args):
+            new_d["arguments"] = copy.deepcopy(otc.arguments)
+            reason = "invalid_write_args_restored_from_original"
+        elif name == "edit" and args.get("path") != otc.arguments.get("path"):
+            # Keep model newText minimization when structure is valid; fix wrong path only
+            new_args = copy.deepcopy(args)
+            new_args["path"] = otc.arguments.get("path", new_args.get("path"))
+            new_d["arguments"] = new_args
+            reason = "edit_path_normalized_to_original"
+        if reason:
+            log.append({"tool": name, "reason": reason, "call_id": cid or otc.call_id})
+        if "id" not in new_d and otc.call_id:
+            new_d["id"] = otc.call_id
+        out.append(new_d)
+
+    return out, log
 
 
 def _determine_scenario(trajectory: ParsedTrajectory, pii_map: PIIMap, turn: AssistantTurn) -> str:
@@ -82,8 +171,9 @@ async def _rewrite_single_turn(
     turn: AssistantTurn,
     pii_map: PIIMap,
     system_prompt: str,
-) -> list[RewrittenTurn]:
-    """Rewrite a single assistant turn using Claude. Returns 1+ turns (multi-turn for consent flows)."""
+    consent_context: str = "",
+) -> tuple[list[RewrittenTurn], list[dict]]:
+    """Rewrite a single assistant turn using Claude. Returns (turns, repair_log entries)."""
     sem = _get_semaphore()
 
     scenario = _determine_scenario(trajectory, pii_map, turn)
@@ -96,6 +186,10 @@ async def _rewrite_single_turn(
         pii_map=pii_map,
         scenario_hint=scenario,
     )
+
+    # Inject consent state so the rewriter knows not to re-ask
+    if consent_context:
+        user_prompt += f"\n\n---\n\n{consent_context}"
 
     async with sem:
         client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
@@ -139,7 +233,13 @@ async def _rewrite_single_turn(
             "scenario": scenario,
         }
 
-    return _parse_rewriter_result(result, turn.turn_index, scenario)
+    turns = _parse_rewriter_result(result, turn.turn_index, scenario)
+    repair_entries: list[dict] = []
+    for t in turns:
+        t.tool_calls, rep = _repair_tool_calls_from_original(turn, t.tool_calls)
+        for r in rep:
+            repair_entries.append({"source_assistant_turn": turn.turn_index, **r})
+    return turns, repair_entries
 
 
 def _parse_rewriter_result(result: dict, turn_index: int, fallback_scenario: str) -> list[RewrittenTurn]:
@@ -211,7 +311,24 @@ def _build_context_for_turn(trajectory: ParsedTrajectory, turn: AssistantTurn) -
 
     if not lines:
         return "PRECEDING TURNS: This is the first assistant turn."
-    return "PRECEDING TURNS:\n" + "\n".join(lines)
+
+    # Flag the current turn's operation type
+    current_ops = []
+    for tc in turn.tool_calls:
+        path = tc.arguments.get("path", "") or tc.arguments.get("file_path", "") or ""
+        is_persistence = any(p in path.lower() for p in ("/memory/", "/notes/", "memory.md"))
+        if tc.name == "read" or tc.name == "memory_search":
+            current_ops.append(f"{tc.name} (READ-ONLY — no consent needed)")
+        elif is_persistence and tc.name in ("write", "edit"):
+            current_ops.append(f"{tc.name}→{path[-40:]} (PERSISTENCE — consent gate needed for L2)")
+        else:
+            current_ops.append(f"{tc.name}")
+
+    op_note = ""
+    if current_ops:
+        op_note = f"\nCURRENT TURN OPERATIONS: {', '.join(current_ops)}"
+
+    return "PRECEDING TURNS:\n" + "\n".join(lines) + op_note
 
 
 def _detect_workspace_path_from_trajectory(trajectory: ParsedTrajectory) -> str:
@@ -391,22 +508,81 @@ async def _inject_adversarial_turns(
     return result_turns
 
 
+def _identify_persistence_turns(trajectory: ParsedTrajectory) -> dict[int, str]:
+    """Pre-scan turns to identify which ones target persistence paths.
+
+    Returns {turn_index: persistence_path} for turns that write to memory/notes paths.
+    """
+    PERSISTENCE_TOOLS = {"memory_write", "active_memory_write", "active_memory_set", "wiki_apply"}
+    result: dict[int, str] = {}
+
+    for turn in trajectory.assistant_turns:
+        for tc in turn.tool_calls:
+            if tc.name in PERSISTENCE_TOOLS:
+                result[turn.turn_index] = tc.name
+                break
+            if tc.name in ("write", "edit", "exec"):
+                path = tc.arguments.get("path", "") or tc.arguments.get("file_path", "") or ""
+                cmd = tc.arguments.get("command", "") or ""
+                target = path or cmd
+                if any(p in target.lower() for p in ("/memory/", "/notes/", "memory.md")):
+                    result[turn.turn_index] = path or target
+                    break
+    return result
+
+
+def _build_consent_state_context(consent_state: dict[str, str]) -> str:
+    """Build a context string telling the rewriter what consent has already been obtained."""
+    if not consent_state:
+        return ""
+    lines = ["CONSENT ALREADY OBTAINED (do NOT re-ask for these paths):"]
+    for path, decision in consent_state.items():
+        lines.append(f"  - {path}: {decision}")
+    lines.append("For these paths, proceed directly with the write (applying data minimization). Do NOT generate a consent_flow.")
+    return "\n".join(lines)
+
+
 async def rewrite_trajectory(
     trajectory: ParsedTrajectory,
     pii_map: PIIMap,
 ) -> RewriteResult:
-    """Rewrite all assistant turns in a trajectory for privacy compliance."""
+    """Rewrite all assistant turns in a trajectory for privacy compliance.
+
+    Key architecture: persistence turns are grouped so only the FIRST write to a
+    given path triggers a consent gate. Subsequent writes to the same path reuse
+    the granted consent and just execute with minimization.
+    """
     workspace_path = _detect_workspace_path_from_trajectory(trajectory)
     system_prompt = build_rewriter_system(workspace_path=workspace_path)
     rewritten_turns: list[RewrittenTurn] = []
+    rewrite_repairs: list[dict] = []
 
-    # Process turns sequentially to maintain context coherence
+    persistence_turns = _identify_persistence_turns(trajectory)
+    consent_state: dict[str, str] = {}
+
     for turn in trajectory.assistant_turns:
-        expanded = await _rewrite_single_turn(trajectory, turn, pii_map, system_prompt)
+        consent_context = _build_consent_state_context(consent_state)
+
+        expanded, rep = await _rewrite_single_turn(
+            trajectory, turn, pii_map, system_prompt,
+            consent_context=consent_context,
+        )
+        rewrite_repairs.extend(rep)
+
+        # Track consent decisions from this turn's output
+        for rt in expanded:
+            if rt.consent_decision and rt.consent_decision != "":
+                path = persistence_turns.get(turn.turn_index, "")
+                if path:
+                    consent_state[path] = rt.consent_decision
+
         rewritten_turns.extend(expanded)
 
     # Inject adversarial turns (1-2 per trajectory)
     rewritten_turns = await _inject_adversarial_turns(trajectory, pii_map, rewritten_turns)
+
+    # Post-process: collapse redundant consent gates
+    rewritten_turns = _collapse_redundant_consent_gates(rewritten_turns)
 
     scenarios_covered = list(set(t.scenario for t in rewritten_turns if t.scenario))
     all_actions = []
@@ -427,7 +603,54 @@ async def rewrite_trajectory(
         scenarios_covered=scenarios_covered,
         skills_used=skills_used,
         privacy_decision_points=decision_points,
+        rewrite_repairs=rewrite_repairs,
     )
+
+
+def _collapse_redundant_consent_gates(turns: list[RewrittenTurn]) -> list[RewrittenTurn]:
+    """Remove duplicate consent gates that ask about the same path within close proximity.
+
+    If a consent gate turn has no tool calls and the next execution turn also has
+    no tool calls (consent was granted but nothing executed), remove the pair.
+    Also collapse consecutive gate→user→gate→user sequences into single gate→user→execute.
+    """
+    if len(turns) < 2:
+        return turns
+
+    result: list[RewrittenTurn] = []
+    seen_consent_paths: set[str] = set()
+    i = 0
+
+    while i < len(turns):
+        turn = turns[i]
+
+        # Check if this is a consent gate (has consent_gate action, no tool calls)
+        is_gate = (
+            "consent_gate" in turn.privacy_actions
+            and not turn.tool_calls
+            and not turn.synthetic_user_message
+        )
+
+        if is_gate and i + 1 < len(turns):
+            next_turn = turns[i + 1]
+            # The next turn should be the execution with synthetic_user_message
+            if next_turn.synthetic_user_message:
+                # Check if we already have consent for a similar operation
+                gate_text_key = turn.text[:50] if turn.text else ""
+                if gate_text_key in seen_consent_paths:
+                    # Skip this redundant gate+execution pair — consent already obtained
+                    i += 2
+                    continue
+                seen_consent_paths.add(gate_text_key)
+
+        result.append(turn)
+        i += 1
+
+    # Re-index
+    for idx, t in enumerate(result):
+        t.turn_index = idx
+
+    return result
 
 
 async def refix_turns(
@@ -496,6 +719,10 @@ async def refix_turns(
             privacy_actions=result.get("privacy_actions", []),
             scenario=result.get("scenario", scenario),
         )
+
+        fixed_turn.tool_calls, rep = _repair_tool_calls_from_original(turn, fixed_turn.tool_calls)
+        for r in rep:
+            rewrite_result.rewrite_repairs.append({"source": "refix", "source_assistant_turn": idx, **r})
 
         # Replace the turn in the result
         for i, t in enumerate(rewrite_result.turns):

@@ -107,6 +107,8 @@ class RewriteResult:
     scenarios_covered: list[str] = field(default_factory=list)
     skills_used: list[str] = field(default_factory=list)
     privacy_decision_points: int = 0
+    # Programmatic fixes applied after Claude (e.g. malformed edit/write JSON)
+    rewrite_repairs: list[dict] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------

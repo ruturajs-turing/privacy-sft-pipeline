@@ -87,6 +87,13 @@ STEP 5 — Execute
 5. **Data Minimization on Writes**: When writing to ANY file, include ONLY the data strictly needed for the task. Strip PII that isn't essential.
 6. **MEMORY.md = Persistence**: Writing to MEMORY.md or any "memory" or "notes" path via `write` or `exec` is EQUIVALENT to `memory_write` for gating purposes. Apply Gate 4a for L3/L4, Gate 4b for L2.
 7. **No Gratuitous PII in Output**: Never embed raw PII in tool call arguments or written files unless the user's explicit instruction requires that exact data in that exact location.
+8. **Self-Scan Write Content for Actual Secrets**: Before persisting to memory/notes, strip ACTUAL secret values:
+   - Actual credential strings (full API key values like `sk-ant-...`, passwords, tokens) → L4 → HARD DENY or strip the value (a log entry like "API key saved to TOOLS.md" is NOT the secret itself — that's fine as L1 metadata)
+   - Raw email addresses (`user@domain.com`) → L2 → strip unless user explicitly said "save my email"
+   - Insurance IDs, SSNs, full card numbers → L3/L4 → HARD DENY
+   - Full names in memory are L2 → acceptable IF consent was obtained; prefer role labels ("the user") when a name adds no value
+   
+   KEY DISTINCTION: A *reference* to a secret existing ("saved API key to TOOLS.md") is NOT the same as the secret value itself. Task log entries are L0/L1. Only strip actual credential values.
 
 ## HUMAN RESPONSE GUIDELINES (for consent_flow user responses)
 
@@ -141,6 +148,22 @@ Given an original assistant turn, ADD privacy compliance while preserving the or
    - If user says "leave out health stuff" — remove ALL health/medical references from the write content
 7. PRESERVE NATURAL TONE: Keep the assistant's original conversational style.
 8. PRESERVE CHRONOLOGY: If the original wrote a file then deleted it, your rewrite must do the same in the same order.
+
+## MEMORY + CONSENT DISCIPLINE (avoid messy / duplicate gates)
+
+- **ONE GATE PER PATH**: Only generate ONE consent gate per unique persistence path per trajectory. If you already asked about `/memory/2026-05-18.md` or `MEMORY.md` in an earlier turn (indicated in CONSENT ALREADY OBTAINED context), do NOT ask again. Just proceed with the write applying data minimization.
+- **NO GATE FOR READS**: `read` and `memory_search` do NOT need consent gates. Only writes/edits to persistence paths trigger consent.
+- **SINGLE CLEAN FLOW**: A consent flow is exactly: (1) assistant asks, (2) user responds, (3) assistant executes or acknowledges denial. Never ask consent AND execute in the same turn without the user response in between.
+- After consent to persist: write **only** what the user asked to remember — **task-stable preferences** (e.g. workout times, project structure), not a full profile dump. Strip employer, insurance IDs, phone, full name, diagnoses from MEMORY unless the **original** user message explicitly asked to retain those categories.
+- **REPLACE NAMES**: In memory/notes content, replace the persona name with "the user" or a role label unless the user explicitly asked "remember my name." Example: "Built a nutrition plan for the user" not "Built a nutrition plan for Minseo."
+- In consent **questions** and assistant **visible** text, avoid echoing raw L2+ strings; use generic labels ("your employer", "your plan") where the detail is not required for the question.
+- **IF CONSENT CONTEXT SAYS "ALREADY OBTAINED"**: Do NOT emit a consent_flow JSON. Emit Format A (normal turn) with the tool call included, applying data minimization to the content.
+
+## VAULT REDIRECT (credentials / full PAN / L4-class secrets)
+
+- If the user wants **long-term** storage of passwords, API keys, full card numbers, or full SSN, **never** place them in MEMORY.md or casual `write` notes.
+- When the original turn already uses vault tools or the user asks for a "vault"/"keyed" store, prefer **`vault_set`** (T1) with a user-chosen key. Otherwise refuse persistence with the Hatch refusal string — **no** MEMORY workaround.
+- Vault does **not** override Gate 4a for **L3 health narrative** into memory-like paths; clinical detail still must not be persisted to MEMORY.
 
 ## OUTPUT FORMAT
 

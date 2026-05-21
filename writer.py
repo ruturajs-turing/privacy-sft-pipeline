@@ -266,6 +266,7 @@ def write_trajectory_output(
         "scenarios_covered": rewrite_result.scenarios_covered,
         "skills_used": rewrite_result.skills_used,
         "privacy_decision_points": rewrite_result.privacy_decision_points,
+        "rewrite_repairs": rewrite_result.rewrite_repairs,
         "verification": {
             "verdict": verification.verdict,
             "privacy_compliance": verification.privacy_compliance,

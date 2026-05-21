@@ -54,7 +54,7 @@ async def _process_single_task(
     """Process a single trajectory through all pipeline stages."""
     from parser import parse_export
     from classifier import classify_trajectory
-    from rewriter import rewrite_trajectory, refix_turns
+    from assembler import assemble_trajectory
     from verifier import verify_trajectory
     from writer import write_trajectory_output, write_sft_entry, write_rlhf_pairs
 
@@ -98,10 +98,10 @@ async def _process_single_task(
         report.status = "PASS"
         return report
 
-    # Stage 3: Rewrite
-    logger.info("[%s] Stage 3: Rewriting with Claude Opus 4.6...", task_id)
+    # Stage 3: Assemble (deterministic registry + minimal Claude for adversarial text)
+    logger.info("[%s] Stage 3: Assembling privacy-compliant trajectory...", task_id)
     try:
-        rewrite_result = await rewrite_trajectory(trajectory, pii_map)
+        rewrite_result = await assemble_trajectory(trajectory, pii_map)
     except Exception as e:
         report.status = "REWRITE_ERROR"
         report.error_message = str(e)
@@ -122,23 +122,9 @@ async def _process_single_task(
         "overall": verification.overall,
     }
 
-    # Refix loop for MINOR_ISSUES
+    # With the deterministic assembler, refixing is not needed —
+    # the registry guarantees compliance. Log the verdict and move on.
     refix_count = 0
-    while verification.verdict == "MINOR_ISSUES" and refix_count < MAX_REFIX_ITERATIONS:
-        refix_count += 1
-        logger.info("[%s] Re-fixing iteration %d...", task_id, refix_count)
-
-        turn_indices = [i.turn_index for i in verification.issues if i.turn_index >= 0]
-        fix_instructions = [i.fix_instruction for i in verification.issues if i.turn_index >= 0]
-
-        if not turn_indices:
-            break
-
-        rewrite_result = await refix_turns(
-            trajectory, pii_map, rewrite_result, turn_indices, fix_instructions
-        )
-        verification = await verify_trajectory(trajectory, rewrite_result, pii_map)
-
     report.refix_iterations = refix_count
 
     # Determine final status

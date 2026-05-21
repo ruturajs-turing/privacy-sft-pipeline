@@ -131,6 +131,9 @@ Enhance this assistant turn with privacy compliance. PRESERVE the original struc
 5. If the original has a T3 tool call, swap to T1 equivalent
 6. If the original has memory_write with L3+ data, replace with the Hatch refusal
 7. If the original deleted a file (exec rm), your rewrite MUST also delete it
+8. If the original has ONLY a `read` or `memory_search` call → no consent gate needed, just classify and proceed
+9. If CONSENT ALREADY OBTAINED is provided below for this path → use Format A (normal), include the tool call, apply data minimization to write content (strip names, emails not explicitly requested by user)
+10. When writing to memory/persistence, MINIMIZE content: use role labels ("the user") instead of names, strip emails/phones, only keep task-relevant info the user asked to remember
 
 Return ONLY the JSON object as specified in the system prompt."""
 

@@ -1,9 +1,10 @@
-"""Stage 2: Multi-engine PII classification — Presidio, Google DLP, OpenAI Filter, Claude LLM."""
+"""Stage 2: Multi-engine PII classification — Presidio, Google DLP, OpenAI Filter, Claude LLM, Pattern."""
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import re
 from pathlib import Path
 
 import anthropic
@@ -193,29 +194,74 @@ async def _run_openai_filter(text: str) -> list[PIIEntity]:
 # Claude LLM Classifier (fine-grained taxonomy from Classification.md)
 # ---------------------------------------------------------------------------
 
-_CLASSIFIER_PROMPT = """You are a PII classifier. Analyze the text and identify ALL personally identifiable information.
+_CLASSIFIER_PROMPT = """You are a highly accurate PII classifier for a privacy-compliance pipeline. Analyze the text and identify ALL personally identifiable information with precise classification.
 
 For each PII item found, output a JSON array of objects:
-{{"text": "<exact text>", "label": "<LABEL_FROM_TAXONOMY>", "level": "<L0|L1|L2|L3|L4>"}}
+{{"text": "<exact text found in the input>", "label": "<LABEL_FROM_TAXONOMY>", "level": "<L0|L1|L2|L3|L4>"}}
 
-Use ONLY labels from this taxonomy:
+## TAXONOMY (label → level):
 {taxonomy}
 
-Rules:
-- Be exhaustive — find EVERY piece of PII
-- If the same text matches multiple labels, use the most specific one
-- Include names, emails, phone numbers, addresses, financial data, health info, credentials
-- Only output the JSON array, nothing else
-- If no PII found, output []"""
+## CRITICAL CLASSIFICATION RULES:
+
+1. **Be exhaustive** — find EVERY piece of PII in the text
+2. **Exact text only** — the "text" field must be a verbatim substring from the input
+3. **Most specific label** — if text matches multiple labels, use the most specific
+4. **References vs. Values**:
+   - A LOG ENTRY like "API key saved to TOOLS.md" or "sent email to X" is METADATA (L1 COMM_TIMESTAMP or L0 PUB_GENERAL_KNOWLEDGE), NOT the credential itself
+   - An ACTUAL credential value like "sk-ant-api03-..." or "password123" is AUTH_API_KEY/AUTH_PASSWORD (L4)
+   - "Maton API key" as a reference/mention = L1 metadata. The actual key string = L4.
+5. **Health data precision**:
+   - Diagnosis names (GAD, ADHD, diabetes, anxiety) = HEALTH_MENTAL_HEALTH or HEALTH_DIAGNOSIS (L3)
+   - Insurance ID numbers (UHC-883-...) = HEALTH_INSURANCE_ID (L2)
+   - Vital signs (65kg, BMI, heart rate) = HEALTH_VITAL (L1)
+6. **Names**: Full names = ID_FULL_NAME (L2). First name alone in context = ID_FULL_NAME (L2) only if clearly a person's name
+7. **Locations**: City names = LOC_GPS_CITY (L1). Street addresses = LOC_STREET_ADDR (L2). Home address = LOC_HOME_ADDR (L3)
+8. **Behavioral data**: Aggregated habits (e.g., "trains 3x/week") = BEHAV_AGGREGATE (L1)
+
+{persona_context}
+
+Output ONLY the JSON array. No explanation, no markdown."""
 
 
-async def _run_llm_classifier(text: str) -> list[PIIEntity]:
-    """Run Claude Opus 4.6 fine-grained classification using full taxonomy."""
+async def _run_llm_classifier(text: str, persona: dict | None = None) -> list[PIIEntity]:
+    """Run Claude Opus 4.6 fine-grained classification using full taxonomy + persona context."""
     if not ENABLE_LLM_CLASSIFIER or not ANTHROPIC_API_KEY:
         return []
 
     classification = _load_classification_map()
     taxonomy_str = "\n".join(f"  {label}: {level}" for label, level in classification.items())
+
+    # Build persona context for better accuracy
+    persona_context = ""
+    if persona:
+        pii_vault = persona.get("pii_vault", {})
+        known_pii = []
+        first = persona.get("first_name", "")
+        last = persona.get("last_name", "")
+        if first and last:
+            known_pii.append(f"- Full name: {first} {last} (ID_FULL_NAME, L2)")
+        health = pii_vault.get("health", {})
+        if health.get("insurance_id"):
+            known_pii.append(f"- Insurance ID: {health['insurance_id']} (HEALTH_INSURANCE_ID, L2)")
+        for d in health.get("diagnoses", []):
+            known_pii.append(f"- Diagnosis: {d} (HEALTH_MENTAL_HEALTH, L3)")
+        gov = pii_vault.get("government", {})
+        if gov.get("ssn"):
+            known_pii.append(f"- SSN: {gov['ssn']} (GOV_SSN_FULL, L4)")
+        contact = pii_vault.get("contact", {})
+        if contact.get("email"):
+            known_pii.append(f"- Email: {contact['email']} (ID_EMAIL, L2)")
+        if contact.get("phone"):
+            known_pii.append(f"- Phone: {contact['phone']} (ID_PHONE, L2)")
+
+        if known_pii:
+            persona_context = "## KNOWN PII FOR THIS PERSONA (if these appear in text, classify them correctly):\n" + "\n".join(known_pii)
+
+    system_prompt = _CLASSIFIER_PROMPT.format(
+        taxonomy=taxonomy_str,
+        persona_context=persona_context,
+    )
 
     client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 
@@ -223,8 +269,8 @@ async def _run_llm_classifier(text: str) -> list[PIIEntity]:
         response = await client.messages.create(
             model=CLASSIFIER_MODEL,
             max_tokens=4096,
-            system=_CLASSIFIER_PROMPT.format(taxonomy=taxonomy_str),
-            messages=[{"role": "user", "content": f"Classify PII in this text:\n\n{text[:8000]}"}],
+            system=system_prompt,
+            messages=[{"role": "user", "content": f"Classify ALL PII in this text:\n\n{text[:12000]}"}],
         )
         tracker.record_anthropic(response, "classifier")
     except Exception as e:
@@ -250,15 +296,133 @@ async def _run_llm_classifier(text: str) -> list[PIIEntity]:
     for item in items:
         if not isinstance(item, dict):
             continue
+        text_val = item.get("text", "")
         label = item.get("label", "")
         level = item.get("level", classification.get(label, "L2"))
+
+        # Post-process: downgrade log references that aren't actual secret values
+        if label == "AUTH_API_KEY" and level == "L4":
+            # If it's a reference like "API key saved to X" rather than an actual key value
+            if "saved to" in text_val or "stored in" in text_val or len(text_val) > 50:
+                level = "L1"
+                label = "COMM_TIMESTAMP"  # It's a log/metadata entry
+
+        # Enforce taxonomy level (don't let LLM override the classification map)
+        canonical_level = classification.get(label)
+        if canonical_level:
+            level = canonical_level
+
         entities.append(PIIEntity(
-            text=item.get("text", ""),
+            text=text_val,
             label=label,
             level=level,
             engines=["llm_classifier"],
             confidence=0.9,
         ))
+    return entities
+
+
+# ---------------------------------------------------------------------------
+# Pattern-Based Fallback (always runs — catches emails, names from persona)
+# ---------------------------------------------------------------------------
+
+_EMAIL_RE = re.compile(r'[\w.+-]+@[\w-]+\.[\w.-]+')
+_PHONE_RE = re.compile(r'\b(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b')
+_SSN_RE = re.compile(r'\b\d{3}-\d{2}-\d{4}\b')
+_INSURANCE_RE = re.compile(r'\b(?:UHC|BCBS|Aetna|Cigna|Kaiser|Humana)[\s-]?\w*[\s-]?\d[\d-]{5,}\b', re.IGNORECASE)
+
+
+def _run_pattern_classifier(text: str, persona: dict | None = None) -> list[PIIEntity]:
+    """Fast regex + persona-aware PII detection. Always runs as fallback."""
+    entities = []
+
+    # Emails
+    for m in _EMAIL_RE.finditer(text):
+        entities.append(PIIEntity(
+            text=m.group(), label="ID_EMAIL", level="L2",
+            start=m.start(), end=m.end(), engines=["pattern"], confidence=0.95,
+        ))
+
+    # Phone numbers
+    for m in _PHONE_RE.finditer(text):
+        entities.append(PIIEntity(
+            text=m.group(), label="ID_PHONE", level="L2",
+            start=m.start(), end=m.end(), engines=["pattern"], confidence=0.85,
+        ))
+
+    # SSNs
+    for m in _SSN_RE.finditer(text):
+        entities.append(PIIEntity(
+            text=m.group(), label="GOV_SSN_FULL", level="L4",
+            start=m.start(), end=m.end(), engines=["pattern"], confidence=0.95,
+        ))
+
+    # Insurance IDs
+    for m in _INSURANCE_RE.finditer(text):
+        entities.append(PIIEntity(
+            text=m.group(), label="HEALTH_INSURANCE_ID", level="L2",
+            start=m.start(), end=m.end(), engines=["pattern"], confidence=0.85,
+        ))
+
+    # Persona name detection (both from persona config and from content heuristics)
+    if persona:
+        first = persona.get("first_name", "")
+        last = persona.get("last_name", "")
+        full_name = f"{first} {last}".strip()
+
+        for name in [full_name, first]:
+            if name and len(name) > 2:
+                idx = text.find(name)
+                while idx >= 0:
+                    entities.append(PIIEntity(
+                        text=name, label="ID_FULL_NAME", level="L2",
+                        start=idx, end=idx + len(name), engines=["pattern_persona"], confidence=0.99,
+                    ))
+                    idx = text.find(name, idx + 1)
+
+    # Detect names that appear near "About X" or "for X" patterns in memory content
+    # Only match 2-3 word names (First Last or First Middle Last)
+    about_pattern = re.compile(r'(?:About|Built .* for|plan for)\s+([A-Z][a-z]{2,}(?:\s+[A-Z][a-z]{2,}){1,2})\b')
+    # Common false positives to exclude
+    _FP_NAMES = frozenset({
+        'south korea', 'north america', 'new york', 'los angeles', 'san francisco',
+        'united states', 'google doc', 'google docs', 'olive young', 'dance fitness',
+        'clinical research', 'your situation', 'common items', 'seoul station',
+        'sunday shop', 'active project', 'session log', 'setup notes',
+        'term memory', 'majang meat', 'mangwon market', 'gwangjang market',
+    })
+    for m in about_pattern.finditer(text):
+        candidate = m.group(1)
+        if candidate.lower() not in _FP_NAMES and len(candidate.split()) <= 3:
+            entities.append(PIIEntity(
+                text=candidate, label="ID_FULL_NAME", level="L2",
+                start=m.start(1), end=m.end(1), engines=["pattern_context"], confidence=0.85,
+            ))
+
+        # Also check PII vault for L3/L4 items
+        vault = persona.get("pii_vault", {})
+        health = vault.get("health", {})
+        if health.get("insurance_id"):
+            ins_id = health["insurance_id"]
+            if ins_id in text:
+                entities.append(PIIEntity(
+                    text=ins_id, label="HEALTH_INSURANCE_ID", level="L2",
+                    engines=["pattern_persona"], confidence=0.99,
+                ))
+        for diag in health.get("diagnoses", []):
+            if diag.lower() in text.lower():
+                entities.append(PIIEntity(
+                    text=diag, label="HEALTH_MENTAL_HEALTH", level="L3",
+                    engines=["pattern_persona"], confidence=0.95,
+                ))
+
+        gov = vault.get("government", {})
+        if gov.get("ssn") and gov["ssn"] in text:
+            entities.append(PIIEntity(
+                text=gov["ssn"], label="GOV_SSN_FULL", level="L4",
+                engines=["pattern_persona"], confidence=0.99,
+            ))
+
     return entities
 
 
@@ -311,7 +475,6 @@ async def classify_trajectory(trajectory: ParsedTrajectory) -> PIIMap:
         for tb in turn.text_blocks:
             all_text_blocks.append(tb)
         for tc in turn.tool_calls:
-            # Check tool arguments too
             args_str = json.dumps(tc.arguments) if tc.arguments else ""
             if args_str:
                 all_text_blocks.append(args_str)
@@ -322,7 +485,7 @@ async def classify_trajectory(trajectory: ParsedTrajectory) -> PIIMap:
     presidio_task = asyncio.get_event_loop().run_in_executor(None, _run_presidio, full_text)
     dlp_task = _run_google_dlp(full_text)
     oai_task = _run_openai_filter(full_text)
-    llm_task = _run_llm_classifier(full_text)
+    llm_task = _run_llm_classifier(full_text, trajectory.persona)
 
     results = await asyncio.gather(presidio_task, dlp_task, oai_task, llm_task, return_exceptions=True)
 
@@ -332,6 +495,10 @@ async def classify_trajectory(trajectory: ParsedTrajectory) -> PIIMap:
             all_entities.extend(r)
         elif isinstance(r, Exception):
             logger.warning("Engine failed: %s", r)
+
+    # Always run pattern classifier as fallback (persona-aware, no API needed)
+    pattern_entities = _run_pattern_classifier(full_text, trajectory.persona)
+    all_entities.extend(pattern_entities)
 
     merged = _merge_entities(all_entities)
 
