@@ -1,0 +1,187 @@
+{
+  "academic-research": [
+    "kb.search"
+  ],
+  "agent-browser": [
+    "web.fetch"
+  ],
+  "caldav-calendar": [
+    "calendar.event.create"
+  ],
+  "edge-tts": [
+    "audio.tts"
+  ],
+  "enterprise-calendar": [
+    "calendar.event.create",
+    "calendar.event.list",
+    "calendar.event.update",
+    "calendar.event.delete"
+  ],
+  "enterprise-database": [
+    "sql.query",
+    "sql.execute",
+    "sql.list_tables",
+    "sql.schema"
+  ],
+  "enterprise-doc-database": [
+    "doc_db.find",
+    "doc_db.insert",
+    "doc_db.update",
+    "doc_db.delete",
+    "doc_db.collections",
+    "doc_db.count"
+  ],
+  "enterprise-gitlab": [
+    "vcs.issue.create",
+    "vcs.issue.list",
+    "vcs.mr.create",
+    "vcs.file.get",
+    "vcs.project.list"
+  ],
+  "enterprise-inference": [
+    "audio.transcribe",
+    "audio.tts",
+    "image.generate",
+    "video.generate"
+  ],
+  "enterprise-mail": [
+    "mail.send",
+    "mail.list",
+    "mail.get",
+    "mail.delete",
+    "mail.attachment.download"
+  ],
+  "enterprise-rag": [
+    "kb.search",
+    "kb.document.add",
+    "kb.document.get",
+    "kb.document.delete",
+    "kb.collections.list",
+    "kb.document.count"
+  ],
+  "enterprise-vault": [
+    "vault.read",
+    "vault.write",
+    "vault.delete",
+    "vault.list"
+  ],
+  "excel-xlsx": [
+    "sheet.create",
+    "sheet.read",
+    "sheet.write"
+  ],
+  "ffmpeg-video-editor": [
+    "video.edit"
+  ],
+  "github": [
+    "vcs.issue.create",
+    "vcs.issue.list",
+    "vcs.mr.create",
+    "vcs.file.get",
+    "vcs.project.list"
+  ],
+  "gmail": [
+    "mail.send",
+    "mail.list"
+  ],
+  "gog": [
+    "mail.send"
+  ],
+  "google-calendar-api": [
+    "calendar.event.create",
+    "calendar.event.list",
+    "calendar.event.update",
+    "calendar.event.delete"
+  ],
+  "google-docs": [
+    "doc.create",
+    "doc.read",
+    "doc.append"
+  ],
+  "google-drive": [
+    "file.upload",
+    "file.download",
+    "file.list"
+  ],
+  "google-sheets": [
+    "sheet.create",
+    "sheet.read",
+    "sheet.write"
+  ],
+  "google-slides": [
+    "slides.create",
+    "slides.add_slide"
+  ],
+  "nano-pdf": [
+    "pdf.extract_text"
+  ],
+  "notion": [
+    "notes.write",
+    "notes.read",
+    "notes.search"
+  ],
+  "obsidian": [
+    "notes.write",
+    "notes.read",
+    "notes.search"
+  ],
+  "openai-whisper": [
+    "audio.transcribe"
+  ],
+  "openai-whisper-api": [
+    "audio.transcribe"
+  ],
+  "openclaw-facebook": [
+    "social.post"
+  ],
+  "openclaw-instagram": [
+    "social.post"
+  ],
+  "openclaw-linkedin": [
+    "social.post"
+  ],
+  "openclaw-reddit": [
+    "social.post"
+  ],
+  "openclaw-youtube": [
+    "social.post"
+  ],
+  "powerpoint-pptx": [
+    "slides.create",
+    "slides.add_slide"
+  ],
+  "sherpa-onnx-tts": [
+    "audio.tts"
+  ],
+  "slack": [
+    "chat.message_post"
+  ],
+  "surya": [
+    "pdf.extract_text",
+    "ocr.run"
+  ],
+  "taskflow": [
+    "task.create",
+    "task.list",
+    "task.complete"
+  ],
+  "tesseract-ocr": [
+    "ocr.run"
+  ],
+  "trello": [
+    "task.create",
+    "task.list",
+    "task.complete"
+  ],
+  "web_fetch": [
+    "web.fetch"
+  ],
+  "web_search": [
+    "kb.search"
+  ],
+  "word-docx": [
+    "doc.create",
+    "doc.read",
+    "doc.append"
+  ]
+}

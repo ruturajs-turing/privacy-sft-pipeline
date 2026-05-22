@@ -83,14 +83,14 @@ The authorization matrix determines what's allowed without consent:
 
 Every tool call is evaluated through:
 1. **Classify** — Determine max sensitivity level of all data in content and arguments
-2. **Validate provenance** — For L3+, verify data comes from current session user messages (amnesia rule)
+2. **Validate provenance** — For L3+, verify data comes from the current user turn, or the immediately prior user turn only when the latest user message explicitly approves a disclosed action (amnesia rule)
 3. **Select tool** — Downgrade to lower-tier equivalent if available (e.g., `gmail` → `enterprise-mail`)
 4. **Apply gate** — Hard deny, vault redirect, consent, or allow based on FREE_BAND
 5. **Execute** — Proceed only if gate allows
 
 ### L3/L4 Provenance & Amnesia Rule
 
-L3/L4 data is valid ONLY if the user mentioned it in the current session. Data from memory reads or prior sessions triggers the **amnesia rule** — the agent must ask the user to re-provide it.
+L3/L4 data is valid ONLY if the current user turn supplies it, or if the immediately previous user turn supplied it and the latest user message is an explicit approval of a disclosed action. Earlier history, memory reads, and prior sessions trigger the **amnesia rule** — the agent must ask the user to re-provide it.
 
 ### Remediation Strategies for L3/L4 Violations
 
@@ -101,13 +101,15 @@ L3/L4 data is valid ONLY if the user mentioned it in the current session. Data f
 | **Vault Redirect** | L3/L4 write, reused 3-4x later | Redirect to `vault_set` encrypted storage |
 | **Exception.md** | L3/L4 write, reused 5+ times | Deny + offer documented exception path |
 
-### Tool Tier Downgrade (Condition 1)
+### Capability-Aware Tool Substitution (Condition 1)
 
-When a T3 tool is used but a lower-tier equivalent exists, the pipeline automatically swaps it:
-- `gmail` → `enterprise-mail`
-- `google-calendar-api` → `enterprise-calendar`
-- `google-docs` → `word-docx`
-- Full map in `data/tool_equivalences.json`
+When a T3 tool is used, the pipeline evaluates whether a lower-tier substitute can serve the same request using a 4-layer architecture (ported from cuarena-pipeline `feat/skill-substitution`):
+- **Layer 1** — Capability lookup: maps tool to one of 61 capabilities in `data/capabilities.json`
+- **Layer 2** — Field coverage: checks if the substitute returns the fields the trajectory actually consumes downstream
+- **Layer 2.5** — Scope guards: per-capability checks (e.g., enterprise-mail rejects external recipients)
+- **Verdicts**: `drop-in` (safe swap), `breaks-downstream` (missing fields), `out-of-scope` (args incompatible)
+
+Param remapping is applied automatically via `param_map` when substituting (e.g., `to` → `recipients`).
 
 ## Multi-Turn Consent Flow
 
@@ -244,7 +246,7 @@ cp .env.example .env
 ### Running the Pipeline
 
 ```bash
-# Full pipeline on a single task
+# Privacy SFT pipeline on a single task (RLHF off by default)
 python run_pipeline.py --input sample_input.csv --task-id T-033-02
 
 # Dry-run (parse + classify only, no LLM rewriting)
@@ -269,7 +271,8 @@ python rlhf_data_builder.py --submission-id <UUID> --task-id T-002-12
 --resume, -r      Resume from checkpoint
 --dry-run         Parse + classify only (no LLM rewriting)
 --concurrency, -c Max concurrent tasks (default: 8)
---no-rlhf         Skip RLHF pair generation (Stage 6)
+--rlhf            Generate RLHF pairs after Privacy SFT output (off by default)
+--no-rlhf         Compatibility flag; keeps RLHF disabled
 ```
 
 ## Token Usage
@@ -287,7 +290,7 @@ Typical costs per trajectory (deterministic assembler is much cheaper than LLM r
 ## Output Formats
 
 ### SFT Dataset (`sft_dataset.jsonl`)
-Standard chat format with user/assistant messages including privacy reasoning in thinking blocks. Includes synthetic user consent responses and adversarial refusal turns.
+One sample-format Privacy SFT record per passing trajectory, matching `privacy-samples-all.json`: `meta_info`, structured `messages`, `_workspace_before`, `_workspace`, and `_source`. No thinking blocks are emitted.
 
 ### RLHF Pairs (`rlhf/rlhf_pairs.jsonl`)
 Step-level preference pairs with chosen + 9 rejected alternatives per decision point. Includes jailbreak-specific rejected alternatives for adversarial turns.
@@ -345,7 +348,8 @@ privacy-sft-pipeline/
 ├── data/
 │   ├── classification.json      # PII label → level mapping (80+ labels)
 │   ├── tool_tiers.json          # Tool tier reference (156 tools, cuarena-aligned)
-│   ├── tool_equivalences.json   # T3→T2/T1 tool downgrade map
+│   ├── capabilities.json        # 61 capabilities, 4-layer skill substitution catalog (from cuarena)
+│   ├── skill_capabilities.json  # Reverse index: skill → capabilities
 │   └── scenarios.json           # Privacy scenario definitions (A-N)
 ├── comparison-ui/
 │   ├── backend/server.py        # FastAPI serving trajectory data

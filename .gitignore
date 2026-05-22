@@ -9,7 +9,13 @@ venv/
 test_output/
 test_run_output*/
 output/
+output_*/
+raw_gcs_exports/
+chroma_db/
 test_input.csv
+test_*.csv
+gcs_test_input.csv
+*.zip
 
 # Keys
 gcs-key.json

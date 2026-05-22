@@ -1,14 +1,14 @@
-"""Stage 4: GPT-5.4 verification — checks HTG compliance, scores, flags issues."""
+"""Stage 4: Claude Opus 4.7 verification — checks HTG compliance, scores, flags issues."""
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
 
+import anthropic
 import json_repair
-import openai
 
-from config import MAX_CONCURRENT_TASKS, OPENAI_API_KEY, VERIFIER_MODEL
+from config import ANTHROPIC_API_KEY, MAX_CONCURRENT_TASKS, VERIFIER_MODEL
 from models import (
     ParsedTrajectory,
     PIIMap,
@@ -18,6 +18,7 @@ from models import (
     VerificationResult,
 )
 from prompts.verifier_system import build_verifier_system
+from task_context import get_task_definition, build_verifier_rubric
 from token_tracker import tracker
 
 logger = logging.getLogger(__name__)
@@ -120,26 +121,30 @@ def _build_trajectory_for_verification(
         lines.append(f"### Assistant Turn {rt.turn_index + 1}:")
         if rt.is_adversarial:
             lines.append("**(This turn responds to the synthetic adversarial user message above.)**")
-        lines.append(f"**Thinking:** {rt.thinking[:500]}{'...' if len(rt.thinking) > 500 else ''}")
-        lines.append(f"**Text:** {rt.text}")
+
+        if rt.text:
+            lines.append(f"**Text:** {rt.text}")
 
         if rt.tool_calls:
             lines.append("**Tool Calls:**")
             for tc in rt.tool_calls:
                 if isinstance(tc, dict):
-                    lines.append(f"  - {tc.get('name', '?')}({json.dumps(tc.get('arguments', {}))[:200]})")
+                    args_str = json.dumps(tc.get('arguments', {}))
+                    if len(args_str) > 400:
+                        args_str = args_str[:400] + "..."
+                    lines.append(f"  - {tc.get('name', '?')}({args_str})")
             lines.append("")
 
         if rt.tool_results:
             lines.append("**Tool Results:**")
             for tr in rt.tool_results:
                 if isinstance(tr, dict):
-                    content = tr.get("content", "")[:150]
+                    content = tr.get("content", "")[:300]
                     lines.append(f"  - [{tr.get('tool_name', '?')}]: {content}")
             lines.append("")
 
-        lines.append(f"**Privacy Actions:** {', '.join(rt.privacy_actions)}")
-        lines.append(f"**Scenario:** {rt.scenario}")
+        if rt.privacy_actions:
+            lines.append(f"**Privacy Actions:** {', '.join(rt.privacy_actions)}")
         lines.append("")
 
     return "\n".join(lines)
@@ -150,47 +155,56 @@ async def verify_trajectory(
     rewrite_result: RewriteResult,
     pii_map: PIIMap,
 ) -> VerificationResult:
-    """Run GPT-5.4 verification on a rewritten trajectory."""
+    """Run Claude Opus 4.7 verification on a rewritten trajectory."""
     sem = _get_semaphore()
     system_prompt = build_verifier_system()
     trajectory_doc = _build_trajectory_for_verification(trajectory, rewrite_result, pii_map)
 
+    # Inject task-specific rubric if available
+    task_def = get_task_definition(trajectory.task_id)
+    rubric_block = ""
+    if task_def:
+        rubric_block = f"""
+## Task-Specific Rubric (from task definition)
+{build_verifier_rubric(task_def)}
+
+Use this rubric as ground truth for what the trajectory SHOULD accomplish and which
+privacy actions are expected. Flag deviations as issues.
+---
+"""
+
     user_prompt = f"""Verify this rewritten privacy trajectory for HTG compliance.
 
-{trajectory_doc}
+{rubric_block}{trajectory_doc}
 
 ---
 
 Evaluate against all 6 HTG rules, check structural integrity, detect PII leaks, and score on the 5 dimensions.
+Use the task-specific rubric above (if present) to verify that expected privacy actions were correctly applied.
 Return the JSON verdict as specified."""
 
+    from llm_retry import call_anthropic
     async with sem:
-        client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
-        try:
-            response = await client.chat.completions.create(
-                model=VERIFIER_MODEL,
-                max_completion_tokens=4096,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                response_format={"type": "json_object"},
-            )
-            tracker.record_openai(response, "verifier")
-        except openai.RateLimitError:
-            await asyncio.sleep(30)
-            response = await client.chat.completions.create(
-                model=VERIFIER_MODEL,
-                max_completion_tokens=4096,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                response_format={"type": "json_object"},
-            )
-            tracker.record_openai(response, "verifier")
+        client = anthropic.AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+        response = await call_anthropic(
+            client,
+            model=VERIFIER_MODEL,
+            max_tokens=4096,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
+            stage="verifier",
+        )
+        tracker.record_anthropic(response, "verifier")
 
-    resp_text = response.choices[0].message.content.strip()
+    resp_text = response.content[0].text.strip()
+
+    # Claude may wrap JSON in markdown fences — strip them
+    if resp_text.startswith("```"):
+        first_newline = resp_text.index("\n") if "\n" in resp_text else 3
+        resp_text = resp_text[first_newline + 1:]
+        if resp_text.endswith("```"):
+            resp_text = resp_text[:-3].strip()
+
     try:
         result = json_repair.loads(resp_text)
     except Exception:

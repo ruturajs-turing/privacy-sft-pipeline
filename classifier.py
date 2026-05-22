@@ -9,6 +9,7 @@ from pathlib import Path
 
 import anthropic
 
+from task_context import extract_pii_vault_entities, get_persona_for_task
 from config import (
     ANTHROPIC_API_KEY,
     CLASSIFIER_MODEL,
@@ -416,7 +417,10 @@ def _run_pattern_classifier(text: str, persona: dict | None = None) -> list[PIIE
                 start=m.start(1), end=m.end(1), engines=["pattern_context"], confidence=0.85,
             ))
 
-        # Also check PII vault for L3/L4 items
+    # Also check PII vault for L3/L4 items. This must run independently of
+    # the contextual name-pattern loop above; many trajectories mention a
+    # diagnosis or SSN without an "About First Last" style phrase nearby.
+    if persona:
         vault = persona.get("pii_vault", {})
         health = vault.get("health", {})
         if health.get("insurance_id"):
@@ -551,6 +555,28 @@ async def classify_trajectory(trajectory: ParsedTrajectory) -> PIIMap:
 
     pattern_entities = _run_pattern_classifier(full_text, trajectory.persona)
     all_entities.extend(pattern_entities)
+
+    # Persona vault boosting: inject ground-truth PII values from the persona's vault
+    persona = trajectory.persona or get_persona_for_task(trajectory.task_id)
+    if persona:
+        vault_entities = extract_pii_vault_entities(persona)
+        for ve in vault_entities:
+            search_text = ve["text"]
+            idx = full_text.find(search_text)
+            while idx >= 0:
+                all_entities.append(PIIEntity(
+                    text=search_text,
+                    label=ve["label"],
+                    level=ve["level"],
+                    start=idx,
+                    end=idx + len(search_text),
+                    engines=["persona_vault"],
+                    confidence=1.0,
+                ))
+                idx = full_text.find(search_text, idx + 1)
+        if vault_entities:
+            logger.info("Persona vault injected %d entity definitions, found matches in text",
+                        len(vault_entities))
 
     merged = _merge_entities(all_entities)
 

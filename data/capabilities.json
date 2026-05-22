@@ -1,0 +1,2894 @@
+{
+  "version": 12,
+  "updated": "2026-05-21",
+  "capabilities": {
+    "mail.send": {
+      "description": "Send an email message to one or more recipients",
+      "skills": [
+        {
+          "tier": 2,
+          "skill": "enterprise-mail",
+          "tool": "mail_send",
+          "params": {
+            "to": "list[string]",
+            "subject": "string",
+            "body": "string",
+            "attachments": "list[{filename:string, content:base64-string, mime_type:string}]?"
+          },
+          "returns": {
+            "shape": "{ok: boolean}",
+            "fields_consumable": [],
+            "notes": "no resource id is returned — substitution breaks any trajectory that consumes a message_id/threadId from the call result"
+          },
+          "side_effects": [
+            "email delivered to corp.com SMTP"
+          ],
+          "scope": "API accepts any recipient at corp gateway — actual SMTP delivery depends on relay config (corp gateway may forward externally)",
+          "constraints": [
+            "response shape is {ok:true} with no message id",
+            "API does NOT filter by recipient domain (verified 2026-05-21: external example.com accepted with {ok:true})",
+            "POLICY consideration: although the API accepts external recipients, the skill is canonically described as 'internal corp mail' — substitution from a T3 cloud mail for external recipients changes which SMTP path the data takes (corp gateway vs Google), which may matter for the privacy policy even when functionally equivalent"
+          ],
+          "verified": true,
+          "source": "live-test 2026-05-21 sk-eleanor-rigby"
+        },
+        {
+          "tier": 3,
+          "skill": "gmail",
+          "tool": "send",
+          "params": {
+            "to": "list[string]",
+            "subject": "string",
+            "body": "string"
+          },
+          "returns": {
+            "shape": "{id: string, threadId: string, labelIds: list[string]}",
+            "fields_consumable": [
+              "id",
+              "threadId",
+              "labelIds"
+            ],
+            "notes": "Gmail message id used by attach_to_thread, label management, and follow-up reads"
+          },
+          "side_effects": [
+            "email delivered via Google SMTP to any address"
+          ],
+          "scope": "any address",
+          "constraints": [
+            "no SKILL.md available — param names, tool function, and return shape unverified"
+          ],
+          "verified": false,
+          "source": "seed_skills.py + proposal Appendix A + Gmail API public docs"
+        },
+        {
+          "tier": 3,
+          "skill": "gog",
+          "tool": "gmail.send",
+          "params": {
+            "to": "list[string]",
+            "subject": "string",
+            "body": "string"
+          },
+          "returns": {
+            "shape": "{id: string, threadId: string}",
+            "fields_consumable": [
+              "id",
+              "threadId"
+            ],
+            "notes": "gog wraps the same Gmail backend so the message id is canonical Gmail"
+          },
+          "side_effects": [
+            "email delivered via Google SMTP to any address"
+          ],
+          "scope": "any address (Google Workspace CLI covers Gmail/Docs/Sheets/Drive)",
+          "constraints": [
+            "tool function name unverified — gog exposes Gmail through a subcommand"
+          ],
+          "verified": false,
+          "source": "proposal Appendix A"
+        }
+      ]
+    },
+    "mail.list": {
+      "description": "List messages — IDs, senders, recipients, subjects, dates, attachment names",
+      "skills": [
+        {
+          "tier": 2,
+          "skill": "enterprise-mail",
+          "tool": "mail_list",
+          "params": {
+            "page": "int?",
+            "pageSize": "int?"
+          },
+          "returns": {
+            "shape": "list[{id: string, subject: string, from: string, to: list[string], receivedDate: iso8601-string, attachments: list[{name: string, size: int}]}]",
+            "fields_consumable": [
+              "id",
+              "subject",
+              "from",
+              "to",
+              "receivedDate",
+              "attachments"
+            ],
+            "notes": "attachments here have no download_url — use mail_get for that. receivedDate is high-precision RFC3339"
+          },
+          "side_effects": [],
+          "scope": "shared/global mail traffic — NOT isolated per authenticated user",
+          "constraints": [
+            "leak risk: response carries L2 PII of other users (sender/recipient addresses + subjects)",
+            "any caller of mail_list at L0 args still receives L2 data in the response — relevant for source_id tracking in stage 0"
+          ],
+          "verified": true,
+          "source": "live-test 2026-05-21 sk-eleanor-rigby"
+        },
+        {
+          "tier": 3,
+          "skill": "gmail",
+          "tool": "list",
+          "params": {},
+          "returns": {
+            "shape": "{messages: list[{id: string, threadId: string}], nextPageToken: string?}",
+            "fields_consumable": [
+              "messages",
+              "nextPageToken"
+            ],
+            "notes": "Gmail API only returns ids in list — body/headers require a follow-up get call"
+          },
+          "side_effects": [],
+          "scope": "user's own inbox only — semantically different from enterprise-mail's shared view",
+          "constraints": [
+            "param schema unverified",
+            "to get equivalent of enterprise-mail.mail_list output, need list + N parallel get calls"
+          ],
+          "verified": false,
+          "source": "proposal Appendix A + Gmail API public docs"
+        }
+      ]
+    },
+    "mail.get": {
+      "description": "Fetch full message body and attachment metadata by message id",
+      "skills": [
+        {
+          "tier": 2,
+          "skill": "enterprise-mail",
+          "tool": "mail_get",
+          "params": {
+            "id": "string"
+          },
+          "returns": {
+            "shape": "{id, from, to, cc, bcc, deliveredTo, receivedDate, subject, parts: list[mime-part], headers: list[{name,value}], attachments: list[{name, size, download_url}], hasHtmlBody, hasPlainTextBody, sessionEncoding, eightBitTransport, secureConnection, mimeParseError, relayError, warnings}",
+            "fields_consumable": [
+              "id",
+              "from",
+              "to",
+              "cc",
+              "bcc",
+              "deliveredTo",
+              "receivedDate",
+              "subject",
+              "attachments",
+              "parts",
+              "headers"
+            ],
+            "notes": "rich MIME tree response; body content lives in parts[].childParts[] base64-encoded — extract via mail_download with the attachments[].download_url"
+          },
+          "side_effects": [],
+          "scope": "any message id visible in mail_list",
+          "constraints": [
+            "404 + {\"detail\":\"Message not found\"} on unknown id (verified 2026-05-21)"
+          ],
+          "verified": true,
+          "source": "live-test 2026-05-21 sk-eleanor-rigby"
+        }
+      ]
+    },
+    "mail.delete": {
+      "description": "Permanently delete a message",
+      "skills": [
+        {
+          "tier": 2,
+          "skill": "enterprise-mail",
+          "tool": "mail_delete",
+          "params": {
+            "id": "string"
+          },
+          "returns": {
+            "shape": "{ok: boolean}",
+            "fields_consumable": [],
+            "notes": "no echo of the deleted id — caller already knows it"
+          },
+          "side_effects": [
+            "message permanently removed from server — irreversible"
+          ],
+          "scope": "any message id reachable by the authenticated user",
+          "constraints": [
+            "idempotent per SKILL.md note: 'safe to call on a uid that does not exist'",
+            "idempotent — {ok:true} returned even for unknown id (verified 2026-05-21)"
+          ],
+          "verified": true,
+          "source": "live-test 2026-05-21 sk-eleanor-rigby"
+        }
+      ]
+    },
+    "mail.attachment.download": {
+      "description": "Download raw attachment bytes by message_id + part_id",
+      "skills": [
+        {
+          "tier": 2,
+          "skill": "enterprise-mail",
+          "tool": "mail_download",
+          "params": {
+            "message_id": "string",
+            "part_id": "string"
+          },
+          "returns": {
+            "shape": "bytes (Content-Type echoed from the original attachment)",
+            "fields_consumable": [],
+            "notes": "raw binary body — no JSON envelope. Substitution must preserve the bytes-out contract"
+          },
+          "side_effects": [],
+          "scope": "any attachment listed in mail_get",
+          "constraints": [],
+          "verified": true,
+          "source": "live-test 2026-05-21 sk-eleanor-rigby"
+        }
+      ]
+    },
+    "calendar.event.create": {
+      "description": "Create a new calendar event with optional attendees and description",
+      "skills": [
+        {
+          "tier": 2,
+          "skill": "enterprise-calendar",
+          "tool": "cal_create",
+          "params": {
+            "title": "string",
+            "start": "iso8601-string",
+            "end": "iso8601-string",
+            "uid": "string?",
+            "attendees": "list[string]?",
+            "description": "string?"
+          },
+          "returns": {
+            "shape": "{uid: string}",
+            "fields_consumable": [
+              "uid"
+            ],
+            "notes": "uid is the canonical CalDAV identifier; persists across update/delete"
+          },
+          "side_effects": [
+            "event added to user's CalDAV calendar",
+            "ICS invitations auto-dispatched to attendees (per SKILL.md + Appendix B)"
+          ],
+          "scope": "authenticated user's own calendar only — CalDAV is per-user isolated",
+          "constraints": [
+            "no get-by-uid endpoint exposed — list only returns hrefs, not event details",
+            "attendees probe 2026-05-21: API accepts attendees list; created event with internal recipients (bob@corp.com, amy@corp.com) — response is {uid} regardless. ICS auto-dispatch happens server-side and is not visible in the response."
+          ],
+          "verified": true,
+          "source": "live-test 2026-05-21 sk-eleanor-rigby"
+        },
+        {
+          "tier": 3,
+          "skill": "google-calendar-api",
+          "tool": "events.insert",
+          "params": {
+            "summary": "string",
+            "start": "{dateTime: iso8601, timeZone: string}",
+            "end": "{dateTime: iso8601, timeZone: string}",
+            "attendees": "list[{email: string}]?",
+            "description": "string?",
+            "sendUpdates": "string? (all|externalOnly|none)"
+          },
+          "param_map": {
+            "summary": "title"
+          },
+          "returns": {
+            "shape": "{id: string, htmlLink: string, status: string, created: iso8601, updated: iso8601, ...}",
+            "fields_consumable": [
+              "id",
+              "htmlLink",
+              "status",
+              "created",
+              "updated"
+            ],
+            "notes": "Google Calendar API returns a rich event object; substitution by enterprise-calendar drops everything except a uid analogue"
+          },
+          "side_effects": [
+            "event added to Google calendar",
+            "invites sent according to sendUpdates flag (default all)"
+          ],
+          "scope": "any Google calendar the OAuth token authorizes",
+          "constraints": [
+            "param shape differs (summary vs title, structured dateTime vs plain ISO) — substitution requires a param adapter",
+            "no SKILL.md available — schema from Google Calendar API public docs"
+          ],
+          "verified": false,
+          "source": "seed_skills.py + Google Calendar API public docs"
+        },
+        {
+          "tier": 3,
+          "skill": "caldav-calendar",
+          "tool": "event_create",
+          "params": {
+            "title": "string",
+            "start": "iso8601-string",
+            "end": "iso8601-string",
+            "attendees": "list[string]?",
+            "description": "string?"
+          },
+          "returns": {
+            "shape": "{uid: string}",
+            "fields_consumable": [
+              "uid"
+            ],
+            "notes": "CalDAV-spec compliant; uid is the .ics filename stem"
+          },
+          "side_effects": [
+            "event added to external CalDAV server",
+            "ICS invitations depend on server implementation"
+          ],
+          "scope": "external CalDAV servers (iCloud, Fastmail, etc.) — not the enterprise gateway",
+          "constraints": [
+            "structurally identical to enterprise-calendar; the only delta is which server",
+            "no SKILL.md available"
+          ],
+          "verified": false,
+          "source": "proposal Appendix A"
+        }
+      ]
+    },
+    "calendar.event.list": {
+      "description": "List calendar events — returns event references (href/uid only, no details)",
+      "skills": [
+        {
+          "tier": 2,
+          "skill": "enterprise-calendar",
+          "tool": "cal_list",
+          "params": {},
+          "returns": {
+            "shape": "list[{href: string}]",
+            "fields_consumable": [
+              "href"
+            ],
+            "notes": "href format: /<calendar_uuid>/default/<event_uid>.ics — uid extractable via filename basename"
+          },
+          "side_effects": [],
+          "scope": "authenticated user's own calendar only",
+          "constraints": [
+            "no event details (title/start/end/attendees) in list response",
+            "no pagination params — full collection returned"
+          ],
+          "verified": true,
+          "source": "live-test 2026-05-21 sk-eleanor-rigby"
+        },
+        {
+          "tier": 3,
+          "skill": "google-calendar-api",
+          "tool": "events.list",
+          "params": {
+            "calendarId": "string?",
+            "timeMin": "iso8601?",
+            "timeMax": "iso8601?",
+            "maxResults": "int?",
+            "pageToken": "string?"
+          },
+          "returns": {
+            "shape": "{items: list[{id, summary, start, end, attendees, ...}], nextPageToken: string?}",
+            "fields_consumable": [
+              "items",
+              "nextPageToken"
+            ],
+            "notes": "Google Calendar returns FULL event objects in list, not just ids — strictly richer than enterprise-calendar"
+          },
+          "side_effects": [],
+          "scope": "any Google calendar the OAuth token authorizes",
+          "constraints": [
+            "substitution by enterprise-calendar loses all event detail — trajectory that consumes summary/start/end from list breaks",
+            "no SKILL.md available"
+          ],
+          "verified": false,
+          "source": "Google Calendar API public docs"
+        }
+      ]
+    },
+    "calendar.event.update": {
+      "description": "Modify fields of an existing calendar event by uid",
+      "skills": [
+        {
+          "tier": 2,
+          "skill": "enterprise-calendar",
+          "tool": "cal_update",
+          "params": {
+            "uid": "string",
+            "title": "string?",
+            "start": "iso8601-string?",
+            "end": "iso8601-string?",
+            "attendees": "list[string]?",
+            "description": "string?"
+          },
+          "returns": {
+            "shape": "{uid: string}",
+            "fields_consumable": [
+              "uid"
+            ],
+            "notes": "echoes the uid; only provided fields are updated"
+          },
+          "side_effects": [
+            "event modified on user's CalDAV calendar",
+            "revised ICS re-sent to attendees (per SKILL.md)"
+          ],
+          "scope": "authenticated user's own calendar only",
+          "constraints": [
+            "NOT idempotent — returns 404 {detail: 'Event not found'} on unknown uid",
+            "attendees param REPLACES the list (no add/remove semantics)",
+            "success path verified 2026-05-21: returns {\"uid\":\"<echo of input uid>\"} — uid echoed back"
+          ],
+          "verified": true,
+          "source": "live-test 2026-05-21 sk-eleanor-rigby (404 shape probed)"
+        },
+        {
+          "tier": 3,
+          "skill": "google-calendar-api",
+          "tool": "events.patch",
+          "params": {
+            "calendarId": "string",
+            "eventId": "string",
+            "summary": "string?",
+            "start": "{dateTime, timeZone}?",
+            "end": "{dateTime, timeZone}?",
+            "attendees": "list[{email}]?"
+          },
+          "param_map": {
+            "eventId": "uid",
+            "summary": "title"
+          },
+          "returns": {
+            "shape": "{id, htmlLink, updated, ...full event...}",
+            "fields_consumable": [
+              "id",
+              "htmlLink",
+              "updated"
+            ],
+            "notes": "Google returns the full updated event"
+          },
+          "side_effects": [
+            "event modified on Google calendar",
+            "invites sent according to sendUpdates"
+          ],
+          "scope": "any authorized Google calendar",
+          "constraints": [
+            "param-name mismatch (eventId vs uid, summary vs title)",
+            "no SKILL.md available"
+          ],
+          "verified": false,
+          "source": "Google Calendar API public docs"
+        }
+      ]
+    },
+    "calendar.event.delete": {
+      "description": "Permanently remove a calendar event by uid",
+      "skills": [
+        {
+          "tier": 2,
+          "skill": "enterprise-calendar",
+          "tool": "cal_delete",
+          "params": {
+            "uid": "string"
+          },
+          "returns": {
+            "shape": "{ok: boolean}",
+            "fields_consumable": [],
+            "notes": "no echo of the deleted uid"
+          },
+          "side_effects": [
+            "event removed from user's CalDAV calendar",
+            "ICS CANCEL semantics depend on CalDAV server — not directly observable from response"
+          ],
+          "scope": "authenticated user's own calendar only",
+          "constraints": [
+            "idempotent — {ok:true} even on uid that does not exist (per SKILL.md)"
+          ],
+          "verified": true,
+          "source": "live-test 2026-05-21 sk-eleanor-rigby"
+        },
+        {
+          "tier": 3,
+          "skill": "google-calendar-api",
+          "tool": "events.delete",
+          "params": {
+            "calendarId": "string",
+            "eventId": "string",
+            "sendUpdates": "string?"
+          },
+          "returns": {
+            "shape": "{} (HTTP 204)",
+            "fields_consumable": [],
+            "notes": "Google returns empty body on success"
+          },
+          "side_effects": [
+            "event removed from Google calendar",
+            "cancellation notice sent per sendUpdates"
+          ],
+          "scope": "any authorized Google calendar",
+          "constraints": [
+            "404 on unknown eventId — NOT idempotent",
+            "no SKILL.md available"
+          ],
+          "verified": false,
+          "source": "Google Calendar API public docs"
+        }
+      ]
+    },
+    "vault.read": {
+      "description": "Read a secret/preference by key from the enterprise vault",
+      "skills": [
+        {
+          "tier": 2,
+          "skill": "enterprise-vault",
+          "tool": "vault_get",
+          "params": {
+            "key": "string",
+            "company": "boolean?"
+          },
+          "returns": {
+            "shape": "{key: string, value: string} | {value: null}",
+            "fields_consumable": [
+              "key",
+              "value"
+            ],
+            "notes": "company=true reads from shared read-only scope"
+          },
+          "side_effects": [],
+          "scope": "user scope (private) or company scope (shared read-only)",
+          "constraints": [
+            "no T1/T3 substitute in our catalog — enterprise-vault is canonical for corp secrets",
+            "prefer {{vault:key}} placeholder injection over explicit vault_get",
+            "only flat keys (no '/') are retrievable through the gateway. See vault.list constraints for the listed-but-unreachable keys finding."
+          ],
+          "verified": true,
+          "source": "live-test 2026-05-21 sk-eleanor-rigby"
+        }
+      ]
+    },
+    "vault.write": {
+      "description": "Store or update a secret/preference in the user scope",
+      "skills": [
+        {
+          "tier": 2,
+          "skill": "enterprise-vault",
+          "tool": "vault_set",
+          "params": {
+            "key": "string",
+            "value": "string"
+          },
+          "returns": {
+            "shape": "{ok: boolean}",
+            "fields_consumable": [],
+            "notes": "no echo"
+          },
+          "side_effects": [
+            "secret persisted in user-scope vault"
+          ],
+          "scope": "user scope only — company scope is read-only",
+          "constraints": [
+            "empty string rejected with HTTP 400 + {\"detail\":\"value required\"} (verified 2026-05-21)"
+          ],
+          "verified": true,
+          "source": "live-test 2026-05-21 sk-eleanor-rigby"
+        }
+      ]
+    },
+    "vault.delete": {
+      "description": "Delete a secret by key from the user vault",
+      "skills": [
+        {
+          "tier": 2,
+          "skill": "enterprise-vault",
+          "tool": "vault_delete",
+          "params": {
+            "key": "string"
+          },
+          "returns": {
+            "shape": "{ok: boolean}",
+            "fields_consumable": [],
+            "notes": ""
+          },
+          "side_effects": [
+            "secret removed from user vault — irreversible"
+          ],
+          "scope": "user scope only",
+          "constraints": [
+            "idempotent — {ok:true} returned even for a key that never existed (verified 2026-05-21)"
+          ],
+          "verified": true,
+          "source": "live-test 2026-05-21 sk-eleanor-rigby"
+        }
+      ]
+    },
+    "vault.list": {
+      "description": "List secret keys in the user vault",
+      "skills": [
+        {
+          "tier": 2,
+          "skill": "enterprise-vault",
+          "tool": "vault_list",
+          "params": {},
+          "returns": {
+            "shape": "{keys: list[string]}",
+            "fields_consumable": [
+              "keys"
+            ],
+            "notes": "values are not returned, only keys"
+          },
+          "side_effects": [],
+          "scope": "current user's keys only",
+          "constraints": [
+            "INCONSISTENCY (verified 2026-05-21): vault_list returns 203 keys, but 190 of them contain '/' in the key name (e.g. 'api_key/github', 'env/GITHUB_TOKEN', 'saas/atlassian-jira/credentials'). The gateway's vault routing treats '/' as a path separator and returns HTTP 404 with detail 'Unknown service: vault' for those keys regardless of URL encoding. Only the 13 flat (no-slash) keys are actually retrievable."
+          ],
+          "verified": true,
+          "source": "live-test 2026-05-21 sk-eleanor-rigby"
+        }
+      ]
+    },
+    "kb.search": {
+      "description": "Semantic / similarity-ranked search over a knowledge base",
+      "skills": [
+        {
+          "tier": 2,
+          "skill": "enterprise-rag",
+          "tool": "rag_search",
+          "params": {
+            "query": "string",
+            "topK": "int?",
+            "collection": "string?"
+          },
+          "returns": {
+            "shape": "list[{id: string, document: string, distance: float, metadata: object}]",
+            "fields_consumable": [
+              "id",
+              "document",
+              "distance",
+              "metadata"
+            ],
+            "notes": "lower distance = more relevant; metadata is arbitrary KV"
+          },
+          "side_effects": [],
+          "scope": "named collection inside the enterprise vector store",
+          "constraints": [
+            "empty query rejected with HTTP 400 + {\"detail\":\"query required\"} (verified 2026-05-21)"
+          ],
+          "verified": true,
+          "source": "live-test 2026-05-21 sk-eleanor-rigby"
+        },
+        {
+          "tier": 3,
+          "skill": "web_search",
+          "tool": "search",
+          "params": {
+            "query": "string",
+            "topK": "int?"
+          },
+          "returns": {
+            "shape": "list[{title: string, url: string, snippet: string}]",
+            "fields_consumable": [
+              "title",
+              "url",
+              "snippet"
+            ],
+            "notes": "public web — semantically different from internal kb"
+          },
+          "side_effects": [],
+          "scope": "public web",
+          "constraints": [
+            "scope mismatch: web vs internal — substitution requires LLM check whether the trajectory's intent was 'internal knowledge' or 'public lookup'",
+            "no SKILL.md available"
+          ],
+          "verified": false,
+          "source": "proposal Appendix A"
+        },
+        {
+          "tier": 3,
+          "skill": "academic-research",
+          "tool": "research",
+          "params": {
+            "query": "string"
+          },
+          "returns": {
+            "shape": "{citations: list[{title, url, snippet}], summary: string}",
+            "fields_consumable": [
+              "citations",
+              "summary"
+            ],
+            "notes": "multi-cycle web research; returns a synthesized summary"
+          },
+          "side_effects": [],
+          "scope": "public web with citation discipline",
+          "constraints": [
+            "richer than web_search but slower; not a drop-in for simple rag_search use",
+            "no SKILL.md available"
+          ],
+          "verified": false,
+          "source": "proposal Appendix A"
+        }
+      ]
+    },
+    "kb.document.add": {
+      "description": "Index a document into the knowledge base for later retrieval",
+      "skills": [
+        {
+          "tier": 2,
+          "skill": "enterprise-rag",
+          "tool": "rag_add",
+          "params": {
+            "docId": "string",
+            "content": "string",
+            "collection": "string?",
+            "metadata": "object?"
+          },
+          "returns": {
+            "shape": "{ok: boolean}",
+            "fields_consumable": [],
+            "notes": ""
+          },
+          "side_effects": [
+            "document embedded and indexed in vector store"
+          ],
+          "scope": "named collection in enterprise vector store",
+          "constraints": [
+            "auto-creates the named collection if it doesn't exist (verified 2026-05-21)"
+          ],
+          "verified": true,
+          "source": "live-test 2026-05-21 sk-eleanor-rigby"
+        }
+      ]
+    },
+    "kb.document.get": {
+      "description": "Retrieve a document from the knowledge base by id",
+      "skills": [
+        {
+          "tier": 2,
+          "skill": "enterprise-rag",
+          "tool": "rag_get",
+          "params": {
+            "docId": "string",
+            "collection": "string?"
+          },
+          "returns": {
+            "shape": "{id: string, document: string} | null",
+            "fields_consumable": [
+              "id",
+              "document"
+            ],
+            "notes": "BARE null at top level when not found (NOT wrapped like vault_get's {value: null}). verified 2026-05-21"
+          },
+          "side_effects": [],
+          "scope": "named collection",
+          "constraints": [],
+          "verified": true,
+          "source": "live-test 2026-05-21 sk-eleanor-rigby"
+        }
+      ]
+    },
+    "kb.document.delete": {
+      "description": "Remove a document from the knowledge base by id",
+      "skills": [
+        {
+          "tier": 2,
+          "skill": "enterprise-rag",
+          "tool": "rag_delete",
+          "params": {
+            "docId": "string",
+            "collection": "string?"
+          },
+          "returns": {
+            "shape": "{ok: boolean}",
+            "fields_consumable": [],
+            "notes": ""
+          },
+          "side_effects": [
+            "document removed from index — irreversible"
+          ],
+          "scope": "named collection",
+          "constraints": [
+            "idempotent — {ok:true} returned even for unknown docId (verified 2026-05-21)"
+          ],
+          "verified": true,
+          "source": "live-test 2026-05-21 sk-eleanor-rigby"
+        }
+      ]
+    },
+    "audio.transcribe": {
+      "description": "Speech-to-text — audio file in, text out",
+      "skills": [
+        {
+          "tier": 1,
+          "skill": "openai-whisper",
+          "tool": "whisper_transcribe",
+          "params": {
+            "file": "string",
+            "language": "string?"
+          },
+          "returns": {
+            "shape": "{text: string}",
+            "fields_consumable": [
+              "text"
+            ],
+            "notes": "local OSS Whisper model — no network"
+          },
+          "side_effects": [],
+          "scope": "local sandbox files only",
+          "constraints": [
+            "tool function name unverified — exact agent-facing signature depends on baseline binary",
+            "model size may differ from cloud variants — transcription quality varies"
+          ],
+          "verified": false,
+          "source": "proposal Appendix A + baseline_dependencies"
+        },
+        {
+          "tier": 2,
+          "skill": "enterprise-inference",
+          "tool": "stt_transcribe",
+          "params": {
+            "file": "string",
+            "lang": "string?"
+          },
+          "returns": {
+            "shape": "{text: string}",
+            "fields_consumable": [
+              "text"
+            ],
+            "notes": "server-side model via the gateway"
+          },
+          "side_effects": [],
+          "scope": "any audio file the gateway can fetch",
+          "constraints": [
+            "live-probe 2026-05-21 (extended): tts/stt/img all returned HTTP 502 — the entire inference backend is unavailable behind the gateway. Routes /inference/v1/audio/speech, /v1/audio/transcriptions, and /v1/images/generations all reachable; upstream service not responding. Response shapes documented from OpenAI API convention — unverified."
+          ],
+          "verified": false,
+          "source": "skill-md (external/enterprise_skills/inference/SKILL.md)"
+        },
+        {
+          "tier": 3,
+          "skill": "openai-whisper-api",
+          "tool": "transcribe",
+          "params": {
+            "file": "string",
+            "language": "string?"
+          },
+          "returns": {
+            "shape": "{text: string}",
+            "fields_consumable": [
+              "text"
+            ],
+            "notes": "OpenAI Whisper cloud endpoint"
+          },
+          "side_effects": [],
+          "scope": "any audio sent to OpenAI",
+          "constraints": [
+            "audio data leaves to OpenAI — strict L1 cap per tier policy"
+          ],
+          "verified": false,
+          "source": "proposal Appendix A"
+        }
+      ]
+    },
+    "audio.tts": {
+      "description": "Text-to-speech — text in, audio out",
+      "skills": [
+        {
+          "tier": 1,
+          "skill": "sherpa-onnx-tts",
+          "tool": "sherpa_speak",
+          "params": {
+            "text": "string",
+            "voice": "string?",
+            "format": "string?"
+          },
+          "returns": {
+            "shape": "bytes (audio)",
+            "fields_consumable": [],
+            "notes": "local ONNX-based TTS"
+          },
+          "side_effects": [],
+          "scope": "local sandbox",
+          "constraints": [
+            "tool function name unverified"
+          ],
+          "verified": false,
+          "source": "proposal Appendix A + baseline_dependencies"
+        },
+        {
+          "tier": 2,
+          "skill": "enterprise-inference",
+          "tool": "tts_speak",
+          "params": {
+            "text": "string",
+            "format": "string?",
+            "path": "string?"
+          },
+          "returns": {
+            "shape": "bytes (audio) | written to path",
+            "fields_consumable": [],
+            "notes": "if path is provided, audio is saved server-side"
+          },
+          "side_effects": [
+            "audio written to path if specified"
+          ],
+          "scope": "any text",
+          "constraints": [
+            "live-probe 2026-05-21 (extended): tts/stt/img all returned HTTP 502 — the entire inference backend is unavailable behind the gateway. Routes /inference/v1/audio/speech, /v1/audio/transcriptions, and /v1/images/generations all reachable; upstream service not responding. Response shapes documented from OpenAI API convention — unverified."
+          ],
+          "verified": false,
+          "source": "skill-md (external/enterprise_skills/inference/SKILL.md)"
+        },
+        {
+          "tier": 3,
+          "skill": "edge-tts",
+          "tool": "speak",
+          "params": {
+            "text": "string",
+            "voice": "string?"
+          },
+          "returns": {
+            "shape": "bytes (audio)",
+            "fields_consumable": [],
+            "notes": "Microsoft Edge TTS external service"
+          },
+          "side_effects": [],
+          "scope": "any text sent to Microsoft",
+          "constraints": [
+            "text leaves to Microsoft — strict L1 cap per tier policy"
+          ],
+          "verified": false,
+          "source": "proposal Appendix A"
+        }
+      ]
+    },
+    "image.generate": {
+      "description": "Generate an image from a text prompt (and optional input image)",
+      "skills": [
+        {
+          "tier": 2,
+          "skill": "enterprise-inference",
+          "tool": "img_generate",
+          "params": {
+            "prompt": "string",
+            "image": "string?",
+            "width": "int?",
+            "height": "int?",
+            "format": "string?"
+          },
+          "returns": {
+            "shape": "bytes (image)",
+            "fields_consumable": [],
+            "notes": ""
+          },
+          "side_effects": [],
+          "scope": "server-side generation",
+          "constraints": [
+            "live-probe 2026-05-21 (extended): tts/stt/img all returned HTTP 502 — the entire inference backend is unavailable behind the gateway. Routes /inference/v1/audio/speech, /v1/audio/transcriptions, and /v1/images/generations all reachable; upstream service not responding. Response shapes documented from OpenAI API convention — unverified."
+          ],
+          "verified": false,
+          "source": "skill-md (external/enterprise_skills/inference/SKILL.md)"
+        }
+      ]
+    },
+    "video.generate": {
+      "description": "Generate a short video from a text prompt (and optional keyframe)",
+      "skills": [
+        {
+          "tier": 2,
+          "skill": "enterprise-inference",
+          "tool": "vid_generate",
+          "params": {
+            "prompt": "string",
+            "image": "string?",
+            "duration": "int?",
+            "format": "string?"
+          },
+          "returns": {
+            "shape": "bytes (video)",
+            "fields_consumable": [],
+            "notes": ""
+          },
+          "side_effects": [],
+          "scope": "server-side generation",
+          "constraints": [
+            "live-probe 2026-05-21 (extended): tts/stt/img all returned HTTP 502 — the entire inference backend is unavailable behind the gateway. Routes /inference/v1/audio/speech, /v1/audio/transcriptions, and /v1/images/generations all reachable; upstream service not responding. Response shapes documented from OpenAI API convention — unverified."
+          ],
+          "verified": false,
+          "source": "skill-md (external/enterprise_skills/inference/SKILL.md)"
+        }
+      ]
+    },
+    "vcs.issue.create": {
+      "description": "Create an issue on a code repository",
+      "skills": [
+        {
+          "tier": 2,
+          "skill": "enterprise-gitlab",
+          "tool": "gitlab_issues_create",
+          "params": {
+            "project": "string",
+            "title": "string",
+            "description": "string?",
+            "labels": "csv-string?"
+          },
+          "param_map": {
+            "description": "body"
+          },
+          "returns": {
+            "shape": "{id, iid, project_id, title, state, web_url, ...}",
+            "fields_consumable": [
+              "id",
+              "iid",
+              "web_url",
+              "state"
+            ],
+            "notes": "iid is the per-project UI number — distinct from global id"
+          },
+          "side_effects": [
+            "issue persisted to enterprise GitLab"
+          ],
+          "scope": "any project the company root PAT can write to",
+          "constraints": [],
+          "verified": false,
+          "source": "skill-md (external/enterprise_skills/gitlab/SKILL.md)"
+        },
+        {
+          "tier": 3,
+          "skill": "github",
+          "tool": "issues_create",
+          "params": {
+            "owner": "string",
+            "repo": "string",
+            "title": "string",
+            "body": "string?",
+            "labels": "list[string]?"
+          },
+          "returns": {
+            "shape": "{id, number, html_url, state, ...}",
+            "fields_consumable": [
+              "id",
+              "number",
+              "html_url",
+              "state"
+            ],
+            "notes": "GitHub uses 'number' analogous to GitLab iid"
+          },
+          "side_effects": [
+            "issue persisted to GitHub"
+          ],
+          "scope": "any public/private repo the OAuth token authorizes",
+          "constraints": [
+            "param shape differs (owner/repo split, body vs description, labels list vs csv) — substitution needs adapter",
+            "no SKILL.md available"
+          ],
+          "verified": false,
+          "source": "seed_skills.py + GitHub REST API public docs"
+        }
+      ]
+    },
+    "vcs.issue.list": {
+      "description": "List issues on a code repository",
+      "skills": [
+        {
+          "tier": 2,
+          "skill": "enterprise-gitlab",
+          "tool": "gitlab_issues_list",
+          "params": {
+            "project": "string",
+            "state": "string?",
+            "labels": "csv-string?",
+            "page": "int?",
+            "perPage": "int?"
+          },
+          "returns": {
+            "shape": "list[{id, iid, title, state, labels, web_url, ...}]",
+            "fields_consumable": [
+              "id",
+              "iid",
+              "title",
+              "state",
+              "labels",
+              "web_url"
+            ],
+            "notes": "20 per page default, max 100"
+          },
+          "side_effects": [],
+          "scope": "any project the company root PAT can read",
+          "constraints": [],
+          "verified": false,
+          "source": "skill-md (external/enterprise_skills/gitlab/SKILL.md)"
+        },
+        {
+          "tier": 3,
+          "skill": "github",
+          "tool": "issues_list",
+          "params": {
+            "owner": "string",
+            "repo": "string",
+            "state": "string?"
+          },
+          "returns": {
+            "shape": "list[{id, number, title, state, labels, html_url, ...}]",
+            "fields_consumable": [
+              "id",
+              "number",
+              "title",
+              "state",
+              "labels",
+              "html_url"
+            ],
+            "notes": "GitHub field names differ: number/html_url vs iid/web_url"
+          },
+          "side_effects": [],
+          "scope": "any authorized repo",
+          "constraints": [],
+          "verified": false,
+          "source": "GitHub REST API public docs"
+        }
+      ]
+    },
+    "vcs.mr.create": {
+      "description": "Create a merge request / pull request",
+      "skills": [
+        {
+          "tier": 2,
+          "skill": "enterprise-gitlab",
+          "tool": "gitlab_mrs_create",
+          "params": {
+            "project": "string",
+            "sourceBranch": "string",
+            "targetBranch": "string",
+            "title": "string",
+            "description": "string?"
+          },
+          "param_map": {
+            "sourceBranch": "head",
+            "targetBranch": "base",
+            "description": "body"
+          },
+          "returns": {
+            "shape": "{id, iid, project_id, title, state, web_url, ...}",
+            "fields_consumable": [
+              "id",
+              "iid",
+              "web_url",
+              "state"
+            ],
+            "notes": "GitLab calls this MR; conceptually equivalent to PR"
+          },
+          "side_effects": [
+            "MR opened on enterprise GitLab"
+          ],
+          "scope": "any project the company root PAT can write to",
+          "constraints": [
+            "source-branch must already exist"
+          ],
+          "verified": false,
+          "source": "skill-md (external/enterprise_skills/gitlab/SKILL.md)"
+        },
+        {
+          "tier": 3,
+          "skill": "github",
+          "tool": "pulls_create",
+          "params": {
+            "owner": "string",
+            "repo": "string",
+            "head": "string",
+            "base": "string",
+            "title": "string",
+            "body": "string?"
+          },
+          "returns": {
+            "shape": "{id, number, html_url, state, head, base, ...}",
+            "fields_consumable": [
+              "id",
+              "number",
+              "html_url",
+              "state"
+            ],
+            "notes": "GitHub uses head/base instead of source/target"
+          },
+          "side_effects": [
+            "PR opened on GitHub"
+          ],
+          "scope": "any authorized repo",
+          "constraints": [
+            "param-name mismatch with GitLab — substitution needs adapter"
+          ],
+          "verified": false,
+          "source": "GitHub REST API public docs"
+        }
+      ]
+    },
+    "vcs.file.get": {
+      "description": "Read a file from a repository at a given ref",
+      "skills": [
+        {
+          "tier": 2,
+          "skill": "enterprise-gitlab",
+          "tool": "gitlab_file_get",
+          "params": {
+            "project": "string",
+            "path": "string",
+            "ref": "string?"
+          },
+          "returns": {
+            "shape": "{file_path: string, content: string, blob_id: string, ref: string, ...}",
+            "fields_consumable": [
+              "file_path",
+              "content",
+              "blob_id",
+              "ref"
+            ],
+            "notes": "content is decoded from base64 server-side"
+          },
+          "side_effects": [],
+          "scope": "any project visible to the company root PAT",
+          "constraints": [
+            "ref defaults to main"
+          ],
+          "verified": false,
+          "source": "skill-md (external/enterprise_skills/gitlab/SKILL.md)"
+        },
+        {
+          "tier": 3,
+          "skill": "github",
+          "tool": "repos_get_content",
+          "params": {
+            "owner": "string",
+            "repo": "string",
+            "path": "string",
+            "ref": "string?"
+          },
+          "returns": {
+            "shape": "{path, content (base64), sha, size, type, ...}",
+            "fields_consumable": [
+              "path",
+              "content",
+              "sha"
+            ],
+            "notes": "content is base64-encoded; client must decode"
+          },
+          "side_effects": [],
+          "scope": "any authorized repo",
+          "constraints": [
+            "content needs base64 decode unlike enterprise-gitlab"
+          ],
+          "verified": false,
+          "source": "GitHub REST API public docs"
+        }
+      ]
+    },
+    "sql.query": {
+      "description": "Run a read-only SQL SELECT against the enterprise application database",
+      "skills": [
+        {
+          "tier": 2,
+          "skill": "enterprise-database",
+          "tool": "database_query",
+          "params": {
+            "sql": "string",
+            "params": "list?",
+            "limit": "int?"
+          },
+          "returns": {
+            "shape": "{rows: list[object], count: int}",
+            "fields_consumable": [
+              "rows",
+              "count"
+            ],
+            "notes": "non-JSON types (datetime/uuid/decimal/bytes) are stringified"
+          },
+          "side_effects": [],
+          "scope": "enterprise app Postgres — separate from gateway users DB",
+          "constraints": [
+            "no T1 substitute in our catalog (would need a local Postgres on shared corp data — doesn't apply)",
+            "no T3 substitute — internal corp DB",
+            "SQL syntax/runtime errors → HTTP 400 with raw Postgres error class in detail (e.g., 'PostgresSyntaxError: ...'). May leak DB engine info — minor concern. verified 2026-05-21",
+            "zero rows is {rows: [], count: 0} — consistent shape, no separate empty case"
+          ],
+          "verified": true,
+          "source": "live-test 2026-05-21 sk-eleanor-rigby"
+        }
+      ]
+    },
+    "sql.execute": {
+      "description": "Run a writing SQL statement (INSERT/UPDATE/DELETE/DDL)",
+      "skills": [
+        {
+          "tier": 2,
+          "skill": "enterprise-database",
+          "tool": "database_execute",
+          "params": {
+            "sql": "string",
+            "params": "list?"
+          },
+          "returns": {
+            "shape": "{command: string, rowcount: int}",
+            "fields_consumable": [
+              "command",
+              "rowcount"
+            ],
+            "notes": "command is the SQL verb (INSERT/UPDATE/...)"
+          },
+          "side_effects": [
+            "data persisted/modified in enterprise Postgres"
+          ],
+          "scope": "enterprise app Postgres",
+          "constraints": [
+            "rowcount=0 for DDL (CREATE/DROP); >0 for DML (INSERT/UPDATE/DELETE). verified 2026-05-21"
+          ],
+          "verified": true,
+          "source": "live-test 2026-05-21 sk-eleanor-rigby (CREATE TABLE / INSERT / DROP cycle)"
+        }
+      ]
+    },
+    "doc_db.find": {
+      "description": "Query documents in the enterprise MongoDB",
+      "skills": [
+        {
+          "tier": 2,
+          "skill": "enterprise-doc-database",
+          "tool": "doc_database_find",
+          "params": {
+            "collection": "string",
+            "filter": "object?",
+            "projection": "object?",
+            "sort": "object?",
+            "limit": "int?",
+            "skip": "int?"
+          },
+          "returns": {
+            "shape": "{docs: list[object], count: int}",
+            "fields_consumable": [
+              "docs",
+              "count"
+            ],
+            "notes": "ObjectId and datetime returned as $oid/$date extended-JSON"
+          },
+          "side_effects": [],
+          "scope": "enterprise MongoDB",
+          "constraints": [
+            "RISK: empty filter returns the full collection. Seeded 'profiles' collection contains L2 PII (name, email, bio) of other personas — any caller can full-scan. relevant for the data_layer tracking in stage 0",
+            "ObjectId values returned as {\"$oid\":\"...\"} extended-JSON; datetime as {\"$date\":\"...\"}. verified 2026-05-21"
+          ],
+          "verified": true,
+          "source": "live-test 2026-05-21 sk-eleanor-rigby"
+        }
+      ]
+    },
+    "doc_db.insert": {
+      "description": "Insert one or many documents into a MongoDB collection",
+      "skills": [
+        {
+          "tier": 2,
+          "skill": "enterprise-doc-database",
+          "tool": "doc_database_insert",
+          "params": {
+            "collection": "string",
+            "document": "object?",
+            "documents": "list?"
+          },
+          "returns": {
+            "shape": "{inserted_ids: list, count: int}",
+            "fields_consumable": [
+              "inserted_ids",
+              "count"
+            ],
+            "notes": ""
+          },
+          "side_effects": [
+            "documents persisted to enterprise MongoDB"
+          ],
+          "scope": "enterprise MongoDB",
+          "constraints": [
+            "document and documents are mutually exclusive",
+            "documents array path verified 2026-05-21: returns {inserted_ids: [...], count: N} for multi-insert"
+          ],
+          "verified": true,
+          "source": "live-test 2026-05-21 sk-eleanor-rigby"
+        }
+      ]
+    },
+    "doc_db.update": {
+      "description": "Update one or many documents matching a filter",
+      "skills": [
+        {
+          "tier": 2,
+          "skill": "enterprise-doc-database",
+          "tool": "doc_database_update",
+          "params": {
+            "collection": "string",
+            "filter": "object",
+            "update": "object",
+            "many": "boolean?",
+            "upsert": "boolean?"
+          },
+          "returns": {
+            "shape": "{matched: int, modified: int, upserted_id: any}",
+            "fields_consumable": [
+              "matched",
+              "modified",
+              "upserted_id"
+            ],
+            "notes": "upserted_id present only when upsert=true and a new doc was created"
+          },
+          "side_effects": [
+            "documents modified in enterprise MongoDB"
+          ],
+          "scope": "enterprise MongoDB",
+          "constraints": [],
+          "verified": true,
+          "source": "live-test 2026-05-21 sk-eleanor-rigby"
+        }
+      ]
+    },
+    "doc_db.delete": {
+      "description": "Delete one or many documents matching a filter",
+      "skills": [
+        {
+          "tier": 2,
+          "skill": "enterprise-doc-database",
+          "tool": "doc_database_delete",
+          "params": {
+            "collection": "string",
+            "filter": "object",
+            "many": "boolean?"
+          },
+          "returns": {
+            "shape": "{deleted_count: int}",
+            "fields_consumable": [
+              "deleted_count"
+            ],
+            "notes": ""
+          },
+          "side_effects": [
+            "documents removed from enterprise MongoDB — irreversible"
+          ],
+          "scope": "enterprise MongoDB",
+          "constraints": [
+            "filter={} deletes the whole collection — destructive"
+          ],
+          "verified": true,
+          "source": "live-test 2026-05-21 sk-eleanor-rigby"
+        }
+      ]
+    },
+    "doc.create": {
+      "description": "Create a word-processor document (text + formatting)",
+      "skills": [
+        {
+          "tier": 1,
+          "skill": "word-docx",
+          "tool": "docx_create",
+          "params": {
+            "path": "string",
+            "title": "string?",
+            "content": "string?"
+          },
+          "returns": {
+            "shape": "{path: string}",
+            "fields_consumable": [
+              "path"
+            ],
+            "notes": "doc written to local filesystem"
+          },
+          "side_effects": [
+            "docx file persisted on local sandbox"
+          ],
+          "scope": "local sandbox path",
+          "constraints": [
+            "tool function name unverified"
+          ],
+          "verified": false,
+          "source": "proposal Appendix A"
+        },
+        {
+          "tier": 3,
+          "skill": "google-docs",
+          "tool": "google_docs_create",
+          "params": {
+            "title": "string",
+            "content": "string?"
+          },
+          "param_map": {
+            "title": "title",
+            "content": "content"
+          },
+          "returns": {
+            "shape": "{documentId: string, title: string, body: object}",
+            "fields_consumable": [
+              "documentId",
+              "title",
+              "body"
+            ],
+            "notes": "documentId is the canonical Google identifier; used by downstream share/permissions"
+          },
+          "side_effects": [
+            "doc created on user's Google Drive"
+          ],
+          "scope": "any Google account the OAuth token authorizes",
+          "constraints": [
+            "no SKILL.md available"
+          ],
+          "verified": false,
+          "source": "seed_skills.py + Google Docs API public docs"
+        }
+      ]
+    },
+    "doc.read": {
+      "description": "Read the text content of a document",
+      "skills": [
+        {
+          "tier": 1,
+          "skill": "word-docx",
+          "tool": "docx_read",
+          "params": {
+            "path": "string"
+          },
+          "returns": {
+            "shape": "{path: string, text: string}",
+            "fields_consumable": [
+              "text"
+            ],
+            "notes": "extracted plain text"
+          },
+          "side_effects": [],
+          "scope": "local sandbox path",
+          "constraints": [],
+          "verified": false,
+          "source": "proposal Appendix A"
+        },
+        {
+          "tier": 3,
+          "skill": "google-docs",
+          "tool": "google_docs_get",
+          "params": {
+            "documentId": "string"
+          },
+          "param_map": {
+            "documentId": "path"
+          },
+          "returns": {
+            "shape": "{documentId: string, title: string, body: object}",
+            "fields_consumable": [
+              "documentId",
+              "title",
+              "body"
+            ],
+            "notes": "rich body with formatting; plain-text not directly returned"
+          },
+          "side_effects": [],
+          "scope": "any authorized Google doc",
+          "constraints": [
+            "returns rich object — substitution by word-docx loses formatting metadata"
+          ],
+          "verified": false,
+          "source": "Google Docs API public docs"
+        }
+      ]
+    },
+    "doc.append": {
+      "description": "Append text to an existing document",
+      "skills": [
+        {
+          "tier": 1,
+          "skill": "word-docx",
+          "tool": "docx_append",
+          "params": {
+            "path": "string",
+            "content": "string"
+          },
+          "returns": {
+            "shape": "{path: string}",
+            "fields_consumable": [
+              "path"
+            ],
+            "notes": ""
+          },
+          "side_effects": [
+            "docx file modified on local sandbox"
+          ],
+          "scope": "local sandbox path",
+          "constraints": [],
+          "verified": false,
+          "source": "proposal Appendix A"
+        },
+        {
+          "tier": 3,
+          "skill": "google-docs",
+          "tool": "google_docs_append",
+          "params": {
+            "documentId": "string",
+            "content": "string"
+          },
+          "returns": {
+            "shape": "{documentId: string}",
+            "fields_consumable": [
+              "documentId"
+            ],
+            "notes": ""
+          },
+          "side_effects": [
+            "doc modified on Google Drive"
+          ],
+          "scope": "any authorized Google doc",
+          "constraints": [],
+          "verified": false,
+          "source": "Google Docs API public docs"
+        }
+      ]
+    },
+    "sheet.create": {
+      "description": "Create a spreadsheet",
+      "skills": [
+        {
+          "tier": 1,
+          "skill": "excel-xlsx",
+          "tool": "xlsx_create",
+          "params": {
+            "path": "string",
+            "sheets": "list[{name, rows}]?"
+          },
+          "returns": {
+            "shape": "{path: string}",
+            "fields_consumable": [
+              "path"
+            ],
+            "notes": ""
+          },
+          "side_effects": [
+            "xlsx file persisted on local sandbox"
+          ],
+          "scope": "local sandbox path",
+          "constraints": [],
+          "verified": false,
+          "source": "proposal Appendix A"
+        },
+        {
+          "tier": 3,
+          "skill": "google-sheets",
+          "tool": "google_sheets_create",
+          "params": {
+            "title": "string"
+          },
+          "returns": {
+            "shape": "{spreadsheetId: string, title: string, sheets: list}",
+            "fields_consumable": [
+              "spreadsheetId",
+              "title",
+              "sheets"
+            ],
+            "notes": "spreadsheetId is canonical Google identifier"
+          },
+          "side_effects": [
+            "sheet created on user's Google Drive"
+          ],
+          "scope": "any authorized Google account",
+          "constraints": [],
+          "verified": false,
+          "source": "Google Sheets API public docs"
+        }
+      ]
+    },
+    "sheet.read": {
+      "description": "Read cells/rows from a spreadsheet",
+      "skills": [
+        {
+          "tier": 1,
+          "skill": "excel-xlsx",
+          "tool": "xlsx_read",
+          "params": {
+            "path": "string",
+            "sheet": "string?",
+            "range": "string?"
+          },
+          "returns": {
+            "shape": "{rows: list[list]}",
+            "fields_consumable": [
+              "rows"
+            ],
+            "notes": ""
+          },
+          "side_effects": [],
+          "scope": "local sandbox path",
+          "constraints": [],
+          "verified": false,
+          "source": "proposal Appendix A"
+        },
+        {
+          "tier": 3,
+          "skill": "google-sheets",
+          "tool": "google_sheets_get",
+          "params": {
+            "spreadsheetId": "string",
+            "range": "string?"
+          },
+          "param_map": {
+            "spreadsheetId": "path"
+          },
+          "returns": {
+            "shape": "{range: string, values: list[list]}",
+            "fields_consumable": [
+              "range",
+              "values"
+            ],
+            "notes": "values is the equivalent of rows"
+          },
+          "side_effects": [],
+          "scope": "any authorized Google sheet",
+          "constraints": [
+            "field rename: values vs rows"
+          ],
+          "verified": false,
+          "source": "Google Sheets API public docs"
+        }
+      ]
+    },
+    "sheet.write": {
+      "description": "Write a value or range of values to a spreadsheet",
+      "skills": [
+        {
+          "tier": 1,
+          "skill": "excel-xlsx",
+          "tool": "xlsx_write",
+          "params": {
+            "path": "string",
+            "sheet": "string?",
+            "range": "string",
+            "values": "list[list]"
+          },
+          "returns": {
+            "shape": "{path: string}",
+            "fields_consumable": [
+              "path"
+            ],
+            "notes": ""
+          },
+          "side_effects": [
+            "xlsx file modified on local sandbox"
+          ],
+          "scope": "local sandbox path",
+          "constraints": [],
+          "verified": false,
+          "source": "proposal Appendix A"
+        },
+        {
+          "tier": 3,
+          "skill": "google-sheets",
+          "tool": "google_sheets_update",
+          "params": {
+            "spreadsheetId": "string",
+            "range": "string",
+            "values": "list[list]"
+          },
+          "param_map": {
+            "spreadsheetId": "path"
+          },
+          "returns": {
+            "shape": "{updatedRange: string, updatedRows: int, updatedColumns: int, updatedCells: int}",
+            "fields_consumable": [
+              "updatedRange",
+              "updatedRows",
+              "updatedColumns",
+              "updatedCells"
+            ],
+            "notes": ""
+          },
+          "side_effects": [
+            "sheet modified on Google Drive"
+          ],
+          "scope": "any authorized Google sheet",
+          "constraints": [],
+          "verified": false,
+          "source": "Google Sheets API public docs"
+        }
+      ]
+    },
+    "slides.create": {
+      "description": "Create a presentation deck",
+      "skills": [
+        {
+          "tier": 1,
+          "skill": "powerpoint-pptx",
+          "tool": "pptx_create",
+          "params": {
+            "path": "string",
+            "title": "string?"
+          },
+          "returns": {
+            "shape": "{path: string}",
+            "fields_consumable": [
+              "path"
+            ],
+            "notes": ""
+          },
+          "side_effects": [
+            "pptx file persisted on local sandbox"
+          ],
+          "scope": "local sandbox path",
+          "constraints": [],
+          "verified": false,
+          "source": "proposal Appendix A"
+        },
+        {
+          "tier": 3,
+          "skill": "google-slides",
+          "tool": "google_slides_create",
+          "params": {
+            "title": "string"
+          },
+          "returns": {
+            "shape": "{presentationId: string, title: string, slides: list}",
+            "fields_consumable": [
+              "presentationId",
+              "title",
+              "slides"
+            ],
+            "notes": "presentationId is canonical Google identifier"
+          },
+          "side_effects": [
+            "deck created on user's Google Drive"
+          ],
+          "scope": "any authorized Google account",
+          "constraints": [],
+          "verified": false,
+          "source": "Google Slides API public docs"
+        }
+      ]
+    },
+    "slides.add_slide": {
+      "description": "Add a slide to an existing deck",
+      "skills": [
+        {
+          "tier": 1,
+          "skill": "powerpoint-pptx",
+          "tool": "pptx_add_slide",
+          "params": {
+            "path": "string",
+            "title": "string?",
+            "body": "string?"
+          },
+          "returns": {
+            "shape": "{path: string, slide_index: int}",
+            "fields_consumable": [
+              "path",
+              "slide_index"
+            ],
+            "notes": ""
+          },
+          "side_effects": [
+            "pptx file modified on local sandbox"
+          ],
+          "scope": "local sandbox path",
+          "constraints": [],
+          "verified": false,
+          "source": "proposal Appendix A"
+        },
+        {
+          "tier": 3,
+          "skill": "google-slides",
+          "tool": "google_slides_add_slide",
+          "params": {
+            "presentationId": "string",
+            "title": "string?",
+            "body": "string?"
+          },
+          "param_map": {
+            "presentationId": "path"
+          },
+          "returns": {
+            "shape": "{presentationId: string, slideId: string}",
+            "fields_consumable": [
+              "presentationId",
+              "slideId"
+            ],
+            "notes": ""
+          },
+          "side_effects": [
+            "deck modified on Google Drive"
+          ],
+          "scope": "any authorized Google deck",
+          "constraints": [],
+          "verified": false,
+          "source": "Google Slides API public docs"
+        }
+      ]
+    },
+    "notes.write": {
+      "description": "Create or update a note in a personal knowledge base",
+      "skills": [
+        {
+          "tier": 1,
+          "skill": "obsidian",
+          "tool": "obsidian_write",
+          "params": {
+            "path": "string",
+            "content": "string"
+          },
+          "returns": {
+            "shape": "{path: string}",
+            "fields_consumable": [
+              "path"
+            ],
+            "notes": "note written to local Obsidian vault"
+          },
+          "side_effects": [
+            "note file persisted in vault"
+          ],
+          "scope": "local Obsidian vault",
+          "constraints": [],
+          "verified": false,
+          "source": "proposal Appendix A"
+        },
+        {
+          "tier": 3,
+          "skill": "notion",
+          "tool": "notion_create_page",
+          "params": {
+            "parent": "string?",
+            "title": "string",
+            "content": "string?"
+          },
+          "param_map": {
+            "title": "path"
+          },
+          "returns": {
+            "shape": "{id: string, url: string, created_time: iso8601}",
+            "fields_consumable": [
+              "id",
+              "url",
+              "created_time"
+            ],
+            "notes": "Notion uses page id (UUID); url is shareable"
+          },
+          "side_effects": [
+            "page persisted to Notion workspace"
+          ],
+          "scope": "any workspace the OAuth token authorizes",
+          "constraints": [
+            "no SKILL.md available"
+          ],
+          "verified": false,
+          "source": "proposal Appendix A + Notion API public docs"
+        }
+      ]
+    },
+    "notes.read": {
+      "description": "Read a note's content",
+      "skills": [
+        {
+          "tier": 1,
+          "skill": "obsidian",
+          "tool": "obsidian_read",
+          "params": {
+            "path": "string"
+          },
+          "returns": {
+            "shape": "{path: string, content: string}",
+            "fields_consumable": [
+              "path",
+              "content"
+            ],
+            "notes": ""
+          },
+          "side_effects": [],
+          "scope": "local Obsidian vault",
+          "constraints": [],
+          "verified": false,
+          "source": "proposal Appendix A"
+        },
+        {
+          "tier": 3,
+          "skill": "notion",
+          "tool": "notion_get_page",
+          "params": {
+            "page_id": "string"
+          },
+          "param_map": {
+            "page_id": "path"
+          },
+          "returns": {
+            "shape": "{id: string, title: string, properties: object, content: list[block]}",
+            "fields_consumable": [
+              "id",
+              "title",
+              "properties",
+              "content"
+            ],
+            "notes": "content is a list of blocks, not flat text"
+          },
+          "side_effects": [],
+          "scope": "any authorized Notion page",
+          "constraints": [
+            "content shape differs significantly — block-based vs flat"
+          ],
+          "verified": false,
+          "source": "Notion API public docs"
+        }
+      ]
+    },
+    "notes.search": {
+      "description": "Search notes by query",
+      "skills": [
+        {
+          "tier": 1,
+          "skill": "obsidian",
+          "tool": "obsidian_search",
+          "params": {
+            "query": "string"
+          },
+          "returns": {
+            "shape": "list[{path: string, snippet: string}]",
+            "fields_consumable": [
+              "path",
+              "snippet"
+            ],
+            "notes": ""
+          },
+          "side_effects": [],
+          "scope": "local Obsidian vault",
+          "constraints": [],
+          "verified": false,
+          "source": "proposal Appendix A"
+        },
+        {
+          "tier": 3,
+          "skill": "notion",
+          "tool": "notion_search",
+          "params": {
+            "query": "string"
+          },
+          "returns": {
+            "shape": "{results: list[{id, title, url, ...}]}",
+            "fields_consumable": [
+              "results"
+            ],
+            "notes": ""
+          },
+          "side_effects": [],
+          "scope": "any authorized Notion workspace",
+          "constraints": [],
+          "verified": false,
+          "source": "Notion API public docs"
+        }
+      ]
+    },
+    "file.upload": {
+      "description": "Upload/store a file to a destination",
+      "skills": [
+        {
+          "tier": 3,
+          "skill": "google-drive",
+          "tool": "gdrive_upload",
+          "params": {
+            "name": "string",
+            "content": "bytes-or-base64",
+            "mime_type": "string?",
+            "parent": "string?"
+          },
+          "returns": {
+            "shape": "{id: string, name: string, mimeType: string, webViewLink: string}",
+            "fields_consumable": [
+              "id",
+              "name",
+              "mimeType",
+              "webViewLink"
+            ],
+            "notes": "id is canonical Drive file id"
+          },
+          "side_effects": [
+            "file persisted on Google Drive"
+          ],
+          "scope": "any authorized Google account",
+          "constraints": [
+            "no SKILL.md available"
+          ],
+          "verified": false,
+          "source": "seed_skills.py + Google Drive API public docs"
+        }
+      ]
+    },
+    "file.download": {
+      "description": "Download/retrieve a file's bytes",
+      "skills": [
+        {
+          "tier": 3,
+          "skill": "google-drive",
+          "tool": "gdrive_download",
+          "params": {
+            "id": "string"
+          },
+          "returns": {
+            "shape": "bytes (with Content-Type)",
+            "fields_consumable": [],
+            "notes": "raw binary body"
+          },
+          "side_effects": [],
+          "scope": "any authorized Drive file",
+          "constraints": [],
+          "verified": false,
+          "source": "Google Drive API public docs"
+        }
+      ]
+    },
+    "file.list": {
+      "description": "List files in a folder/collection",
+      "skills": [
+        {
+          "tier": 3,
+          "skill": "google-drive",
+          "tool": "gdrive_list",
+          "params": {
+            "parent": "string?",
+            "query": "string?",
+            "pageSize": "int?"
+          },
+          "returns": {
+            "shape": "{files: list[{id, name, mimeType, modifiedTime}], nextPageToken: string?}",
+            "fields_consumable": [
+              "files",
+              "nextPageToken"
+            ],
+            "notes": ""
+          },
+          "side_effects": [],
+          "scope": "any authorized Drive area",
+          "constraints": [],
+          "verified": false,
+          "source": "Google Drive API public docs"
+        }
+      ]
+    },
+    "task.create": {
+      "description": "Create a task / card on a personal task board",
+      "skills": [
+        {
+          "tier": 1,
+          "skill": "taskflow",
+          "tool": "task_create",
+          "params": {
+            "title": "string",
+            "due": "iso8601?",
+            "list": "string?"
+          },
+          "returns": {
+            "shape": "{id: string, title: string}",
+            "fields_consumable": [
+              "id",
+              "title"
+            ],
+            "notes": ""
+          },
+          "side_effects": [
+            "task persisted in local taskflow store"
+          ],
+          "scope": "local sandbox taskflow store",
+          "constraints": [
+            "tool function name unverified"
+          ],
+          "verified": false,
+          "source": "proposal Appendix A"
+        },
+        {
+          "tier": 3,
+          "skill": "trello",
+          "tool": "trello_create_card",
+          "params": {
+            "board": "string",
+            "list": "string",
+            "title": "string",
+            "due": "iso8601?"
+          },
+          "param_map": {
+            "title": "title"
+          },
+          "returns": {
+            "shape": "{id: string, name: string, url: string, idBoard: string, idList: string}",
+            "fields_consumable": [
+              "id",
+              "name",
+              "url",
+              "idBoard",
+              "idList"
+            ],
+            "notes": "Trello uses 'name' instead of 'title'"
+          },
+          "side_effects": [
+            "card persisted on Trello board"
+          ],
+          "scope": "any authorized Trello board",
+          "constraints": [
+            "param rename: name vs title"
+          ],
+          "verified": false,
+          "source": "Trello API public docs"
+        }
+      ]
+    },
+    "task.list": {
+      "description": "List tasks / cards",
+      "skills": [
+        {
+          "tier": 1,
+          "skill": "taskflow",
+          "tool": "task_list",
+          "params": {
+            "list": "string?"
+          },
+          "returns": {
+            "shape": "list[{id: string, title: string, done: boolean, due: iso8601?}]",
+            "fields_consumable": [
+              "id",
+              "title",
+              "done",
+              "due"
+            ],
+            "notes": ""
+          },
+          "side_effects": [],
+          "scope": "local sandbox taskflow store",
+          "constraints": [],
+          "verified": false,
+          "source": "proposal Appendix A"
+        },
+        {
+          "tier": 3,
+          "skill": "trello",
+          "tool": "trello_list_cards",
+          "params": {
+            "board": "string",
+            "list": "string?"
+          },
+          "returns": {
+            "shape": "list[{id, name, url, due, idList, ...}]",
+            "fields_consumable": [
+              "id",
+              "name",
+              "url",
+              "due",
+              "idList"
+            ],
+            "notes": "Trello uses 'name' instead of 'title'"
+          },
+          "side_effects": [],
+          "scope": "any authorized Trello board",
+          "constraints": [
+            "param/field rename: name vs title"
+          ],
+          "verified": false,
+          "source": "Trello API public docs"
+        }
+      ]
+    },
+    "task.complete": {
+      "description": "Mark a task / card as done",
+      "skills": [
+        {
+          "tier": 1,
+          "skill": "taskflow",
+          "tool": "task_complete",
+          "params": {
+            "id": "string"
+          },
+          "returns": {
+            "shape": "{id: string, done: boolean}",
+            "fields_consumable": [
+              "id",
+              "done"
+            ],
+            "notes": ""
+          },
+          "side_effects": [
+            "task marked done in taskflow store"
+          ],
+          "scope": "local sandbox taskflow store",
+          "constraints": [],
+          "verified": false,
+          "source": "proposal Appendix A"
+        },
+        {
+          "tier": 3,
+          "skill": "trello",
+          "tool": "trello_archive_card",
+          "params": {
+            "card_id": "string"
+          },
+          "param_map": {
+            "card_id": "id"
+          },
+          "returns": {
+            "shape": "{id: string, closed: boolean}",
+            "fields_consumable": [
+              "id",
+              "closed"
+            ],
+            "notes": "Trello 'archives' rather than 'completes' — semantically close but not identical"
+          },
+          "side_effects": [
+            "card archived on Trello board"
+          ],
+          "scope": "any authorized Trello board",
+          "constraints": [
+            "Trello has no native 'done' state; archive is the canonical closing op"
+          ],
+          "verified": false,
+          "source": "Trello API public docs"
+        }
+      ]
+    },
+    "pdf.extract_text": {
+      "description": "Extract plain text from a PDF file",
+      "skills": [
+        {
+          "tier": 1,
+          "skill": "nano-pdf",
+          "tool": "pdf_extract_text",
+          "params": {
+            "path": "string"
+          },
+          "returns": {
+            "shape": "{text: string, pages: int}",
+            "fields_consumable": [
+              "text",
+              "pages"
+            ],
+            "notes": ""
+          },
+          "side_effects": [],
+          "scope": "local sandbox path",
+          "constraints": [],
+          "verified": false,
+          "source": "proposal Appendix A"
+        },
+        {
+          "tier": 1,
+          "skill": "surya",
+          "tool": "surya_layout",
+          "params": {
+            "path": "string"
+          },
+          "returns": {
+            "shape": "{text: string, layout: list[block], reading_order: list[int]}",
+            "fields_consumable": [
+              "text",
+              "layout",
+              "reading_order"
+            ],
+            "notes": "surya also returns layout + reading order; richer than nano-pdf"
+          },
+          "side_effects": [],
+          "scope": "local sandbox path",
+          "constraints": [],
+          "verified": false,
+          "source": "proposal Appendix A"
+        }
+      ]
+    },
+    "ocr.run": {
+      "description": "Run OCR on an image or scanned document",
+      "skills": [
+        {
+          "tier": 1,
+          "skill": "tesseract-ocr",
+          "tool": "tesseract_extract",
+          "params": {
+            "path": "string",
+            "lang": "string?"
+          },
+          "returns": {
+            "shape": "{text: string}",
+            "fields_consumable": [
+              "text"
+            ],
+            "notes": ""
+          },
+          "side_effects": [],
+          "scope": "local sandbox path",
+          "constraints": [],
+          "verified": false,
+          "source": "proposal Appendix A"
+        },
+        {
+          "tier": 1,
+          "skill": "surya",
+          "tool": "surya_ocr",
+          "params": {
+            "path": "string",
+            "lang": "string?"
+          },
+          "returns": {
+            "shape": "{text: string, layout: list[block]}",
+            "fields_consumable": [
+              "text",
+              "layout"
+            ],
+            "notes": "surya does OCR + layout in one pass"
+          },
+          "side_effects": [],
+          "scope": "local sandbox path",
+          "constraints": [],
+          "verified": false,
+          "source": "proposal Appendix A"
+        }
+      ]
+    },
+    "video.edit": {
+      "description": "Edit / transcode / cut a video file",
+      "skills": [
+        {
+          "tier": 1,
+          "skill": "ffmpeg-video-editor",
+          "tool": "video_edit",
+          "params": {
+            "input": "string",
+            "output": "string",
+            "operations": "list[object]"
+          },
+          "returns": {
+            "shape": "{path: string, duration: float}",
+            "fields_consumable": [
+              "path",
+              "duration"
+            ],
+            "notes": ""
+          },
+          "side_effects": [
+            "video file persisted on local sandbox"
+          ],
+          "scope": "local sandbox path",
+          "constraints": [],
+          "verified": false,
+          "source": "proposal Appendix A + baseline_dependencies"
+        }
+      ]
+    },
+    "web.fetch": {
+      "description": "Fetch a URL and return its content",
+      "skills": [
+        {
+          "tier": 3,
+          "skill": "web_fetch",
+          "tool": "web_fetch",
+          "params": {
+            "url": "string",
+            "method": "string?"
+          },
+          "returns": {
+            "shape": "{status: int, headers: object, body: string}",
+            "fields_consumable": [
+              "status",
+              "headers",
+              "body"
+            ],
+            "notes": ""
+          },
+          "side_effects": [],
+          "scope": "public web",
+          "constraints": [
+            "any data sent in body/headers leaves to the destination"
+          ],
+          "verified": false,
+          "source": "proposal Appendix A"
+        },
+        {
+          "tier": 3,
+          "skill": "agent-browser",
+          "tool": "agent_browse",
+          "params": {
+            "url": "string",
+            "action": "string?"
+          },
+          "returns": {
+            "shape": "{url: string, title: string, content: string, screenshot: string?}",
+            "fields_consumable": [
+              "url",
+              "title",
+              "content",
+              "screenshot"
+            ],
+            "notes": "headless browser — handles JS, returns rendered content"
+          },
+          "side_effects": [],
+          "scope": "public web (unrestricted)",
+          "constraints": [],
+          "verified": false,
+          "source": "proposal Appendix A"
+        }
+      ]
+    },
+    "chat.message_post": {
+      "description": "Post a message to a chat channel / direct message",
+      "skills": [
+        {
+          "tier": 3,
+          "skill": "slack",
+          "tool": "slack_post_message",
+          "params": {
+            "channel": "string",
+            "text": "string",
+            "thread_ts": "string?"
+          },
+          "returns": {
+            "shape": "{ok: boolean, channel: string, ts: string, message: object}",
+            "fields_consumable": [
+              "ok",
+              "channel",
+              "ts",
+              "message"
+            ],
+            "notes": "ts is the timestamp id of the new message"
+          },
+          "side_effects": [
+            "message posted to Slack channel"
+          ],
+          "scope": "any Slack workspace the OAuth token authorizes",
+          "constraints": [],
+          "verified": false,
+          "source": "proposal Appendix A + Slack API public docs"
+        }
+      ]
+    },
+    "social.post": {
+      "description": "Post content to a social media platform",
+      "skills": [
+        {
+          "tier": 3,
+          "skill": "openclaw-facebook",
+          "tool": "fb_post",
+          "params": {
+            "text": "string",
+            "media": "list?"
+          },
+          "returns": {
+            "shape": "{id: string, post_url: string}",
+            "fields_consumable": [
+              "id",
+              "post_url"
+            ],
+            "notes": ""
+          },
+          "side_effects": [
+            "public post on Facebook timeline"
+          ],
+          "scope": "Facebook (public)",
+          "constraints": [
+            "data leaves to public network — strict L0 only"
+          ],
+          "verified": false,
+          "source": "proposal Appendix A (clawhub plugin)"
+        },
+        {
+          "tier": 3,
+          "skill": "openclaw-instagram",
+          "tool": "ig_post",
+          "params": {
+            "caption": "string",
+            "media": "list"
+          },
+          "returns": {
+            "shape": "{id: string, permalink: string}",
+            "fields_consumable": [
+              "id",
+              "permalink"
+            ],
+            "notes": ""
+          },
+          "side_effects": [
+            "public post on Instagram"
+          ],
+          "scope": "Instagram (public)",
+          "constraints": [
+            "data leaves to public network — strict L0 only"
+          ],
+          "verified": false,
+          "source": "proposal Appendix A (clawhub plugin)"
+        },
+        {
+          "tier": 3,
+          "skill": "openclaw-linkedin",
+          "tool": "li_post",
+          "params": {
+            "text": "string"
+          },
+          "returns": {
+            "shape": "{id: string, url: string}",
+            "fields_consumable": [
+              "id",
+              "url"
+            ],
+            "notes": ""
+          },
+          "side_effects": [
+            "public post on LinkedIn"
+          ],
+          "scope": "LinkedIn (public)",
+          "constraints": [
+            "data leaves to public network"
+          ],
+          "verified": false,
+          "source": "proposal Appendix A (clawhub plugin)"
+        },
+        {
+          "tier": 3,
+          "skill": "openclaw-reddit",
+          "tool": "reddit_post",
+          "params": {
+            "subreddit": "string",
+            "title": "string",
+            "text": "string?"
+          },
+          "returns": {
+            "shape": "{id: string, url: string, subreddit: string}",
+            "fields_consumable": [
+              "id",
+              "url",
+              "subreddit"
+            ],
+            "notes": ""
+          },
+          "side_effects": [
+            "public post on Reddit subreddit"
+          ],
+          "scope": "Reddit (public)",
+          "constraints": [
+            "data leaves to public network"
+          ],
+          "verified": false,
+          "source": "proposal Appendix A (clawhub plugin)"
+        },
+        {
+          "tier": 3,
+          "skill": "openclaw-youtube",
+          "tool": "yt_upload",
+          "params": {
+            "title": "string",
+            "description": "string?",
+            "video_path": "string"
+          },
+          "returns": {
+            "shape": "{id: string, url: string}",
+            "fields_consumable": [
+              "id",
+              "url"
+            ],
+            "notes": ""
+          },
+          "side_effects": [
+            "public video uploaded to YouTube"
+          ],
+          "scope": "YouTube (public)",
+          "constraints": [
+            "data leaves to public network"
+          ],
+          "verified": false,
+          "source": "proposal Appendix A (clawhub plugin)"
+        }
+      ]
+    },
+    "kb.collections.list": {
+      "description": "List the named collections in the enterprise vector store",
+      "skills": [
+        {
+          "tier": 2,
+          "skill": "enterprise-rag",
+          "tool": "rag_collections",
+          "params": {},
+          "param_map": {},
+          "returns": {
+            "shape": "list[string]",
+            "fields_consumable": [],
+            "notes": "names only — no metadata"
+          },
+          "side_effects": [],
+          "scope": "enterprise vector store",
+          "constraints": [],
+          "verified": true,
+          "source": "live-test 2026-05-21 sk-eleanor-rigby"
+        }
+      ]
+    },
+    "kb.document.count": {
+      "description": "Count documents in a knowledge-base collection",
+      "skills": [
+        {
+          "tier": 2,
+          "skill": "enterprise-rag",
+          "tool": "rag_count",
+          "params": {
+            "collection": "string?"
+          },
+          "param_map": {},
+          "returns": {
+            "shape": "int",
+            "fields_consumable": [],
+            "notes": "bare integer at top level, NOT wrapped in an object"
+          },
+          "side_effects": [],
+          "scope": "named collection",
+          "constraints": [],
+          "verified": true,
+          "source": "live-test 2026-05-21 sk-eleanor-rigby"
+        }
+      ]
+    },
+    "sql.list_tables": {
+      "description": "List tables in a schema of the enterprise relational DB",
+      "skills": [
+        {
+          "tier": 2,
+          "skill": "enterprise-database",
+          "tool": "database_tables",
+          "params": {
+            "schema": "string?"
+          },
+          "param_map": {},
+          "returns": {
+            "shape": "list[string]",
+            "fields_consumable": [],
+            "notes": "default schema = public"
+          },
+          "side_effects": [],
+          "scope": "enterprise app Postgres",
+          "constraints": [],
+          "verified": true,
+          "source": "live-test 2026-05-21 sk-eleanor-rigby"
+        }
+      ]
+    },
+    "sql.schema": {
+      "description": "Describe columns of a relational table",
+      "skills": [
+        {
+          "tier": 2,
+          "skill": "enterprise-database",
+          "tool": "database_schema",
+          "params": {
+            "table": "string",
+            "schema": "string?"
+          },
+          "param_map": {},
+          "returns": {
+            "shape": "list[{name: string, type: string, nullable: boolean, default: string|null}]",
+            "fields_consumable": [
+              "name",
+              "type",
+              "nullable",
+              "default"
+            ],
+            "notes": "Postgres native types in `type` (e.g., 'timestamp with time zone')"
+          },
+          "side_effects": [],
+          "scope": "enterprise app Postgres",
+          "constraints": [
+            "404 + {\"detail\":\"table not found: <schema>.<table>\"} on unknown table (verified 2026-05-21)"
+          ],
+          "verified": true,
+          "source": "live-test 2026-05-21 sk-eleanor-rigby"
+        }
+      ]
+    },
+    "doc_db.collections": {
+      "description": "List collections in the enterprise MongoDB",
+      "skills": [
+        {
+          "tier": 2,
+          "skill": "enterprise-doc-database",
+          "tool": "doc_database_collections",
+          "params": {},
+          "param_map": {},
+          "returns": {
+            "shape": "list[string]",
+            "fields_consumable": [],
+            "notes": "sorted names"
+          },
+          "side_effects": [],
+          "scope": "enterprise MongoDB",
+          "constraints": [],
+          "verified": true,
+          "source": "live-test 2026-05-21 sk-eleanor-rigby"
+        }
+      ]
+    },
+    "doc_db.count": {
+      "description": "Count documents in a MongoDB collection (optionally filtered)",
+      "skills": [
+        {
+          "tier": 2,
+          "skill": "enterprise-doc-database",
+          "tool": "doc_database_count",
+          "params": {
+            "collection": "string",
+            "filter": "object?"
+          },
+          "param_map": {},
+          "returns": {
+            "shape": "{count: int}",
+            "fields_consumable": [
+              "count"
+            ],
+            "notes": ""
+          },
+          "side_effects": [],
+          "scope": "enterprise MongoDB",
+          "constraints": [],
+          "verified": true,
+          "source": "live-test 2026-05-21 sk-eleanor-rigby"
+        }
+      ]
+    },
+    "vcs.project.list": {
+      "description": "List code repositories visible to the caller",
+      "skills": [
+        {
+          "tier": 2,
+          "skill": "enterprise-gitlab",
+          "tool": "gitlab_projects_list",
+          "params": {
+            "search": "string?",
+            "owned": "boolean?",
+            "membership": "boolean?",
+            "page": "int?",
+            "perPage": "int?"
+          },
+          "param_map": {},
+          "returns": {
+            "shape": "list[{id: int, path_with_namespace: string, name: string, web_url: string, default_branch: string, visibility: string, ...}]",
+            "fields_consumable": [
+              "id",
+              "path_with_namespace",
+              "name",
+              "web_url",
+              "default_branch",
+              "visibility"
+            ],
+            "notes": "GitLab REST shape per public docs"
+          },
+          "side_effects": [],
+          "scope": "projects accessible to the company root PAT",
+          "constraints": [
+            "live-probe 2026-05-21 (extended): tested with sk-eleanor-rigby, sk-amy, sk-gio and direct /gitlab/groups — all return empty. The seeded GitLab behind the gateway either has no projects or none visible through the proxy. Endpoint route + list-shape confirmed; populated-shape unverifiable from this gateway."
+          ],
+          "verified": true,
+          "source": "live-test 2026-05-21 sk-eleanor-rigby (empty list) + GitLab REST docs"
+        },
+        {
+          "tier": 3,
+          "skill": "github",
+          "tool": "repos_list",
+          "params": {
+            "affiliation": "string?",
+            "visibility": "string?",
+            "per_page": "int?"
+          },
+          "param_map": {
+            "per_page": "perPage"
+          },
+          "returns": {
+            "shape": "list[{id: int, full_name: string, name: string, html_url: string, default_branch: string, private: boolean, ...}]",
+            "fields_consumable": [
+              "id",
+              "full_name",
+              "name",
+              "html_url",
+              "default_branch",
+              "private"
+            ],
+            "notes": "GitHub REST shape; field-name mismatch with GitLab (full_name vs path_with_namespace, html_url vs web_url)"
+          },
+          "side_effects": [],
+          "scope": "any repo the OAuth token authorizes",
+          "constraints": [
+            "no SKILL.md available — shape from GitHub REST docs"
+          ],
+          "verified": false,
+          "source": "GitHub REST API public docs"
+        }
+      ]
+    }
+  }
+}

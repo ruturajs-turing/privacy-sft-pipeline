@@ -19,7 +19,8 @@ GOOGLE_APPLICATION_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
 # Models
 REWRITER_MODEL = "claude-opus-4-7"
 CLASSIFIER_MODEL = "claude-opus-4-7"
-VERIFIER_MODEL = "gpt-5.4"
+VERIFIER_MODEL = "claude-opus-4-7"
+REFIX_LLM_MODEL = "claude-sonnet-4-20250514"
 
 # Concurrency
 MAX_CONCURRENT_TASKS = int(os.getenv("CONCURRENCY", "8"))
@@ -42,6 +43,10 @@ GCS_SERVICE_ACCOUNT_PATH = os.getenv(
 PERSONAS_PATH = BASE_DIR.parent / "privacy-personas.json"
 PERSONAS_JSON_PATH = PERSONAS_PATH  # alias used by rlhf_data_builder
 TASKS_PATH = BASE_DIR.parent / "privacy-task-generator" / "outputs" / "tasks_all.json"
+
+# Real trajectory data (4000 samples)
+EXTRACTED_TRAJECTORIES_PATH = BASE_DIR.parent / "extracted-trajectories"
+CUARENA_BATCH_PATH = BASE_DIR.parent / "CUArena" / "examples" / "combined_batch.csv"
 
 # Quality gates
 MIN_PRIVACY_COMPLIANCE = 4

@@ -4,6 +4,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import re
 import tempfile
 import zipfile
 from pathlib import Path
@@ -77,6 +78,59 @@ def _normalize_ts(val) -> int:
     return 0
 
 
+def _looks_like_valid_jsonl(zf: zipfile.ZipFile, name: str) -> bool:
+    """Return True when a zip member has at least one parseable JSONL event."""
+    try:
+        if zf.getinfo(name).file_size <= 0:
+            return False
+        text = zf.read(name).decode("utf-8", errors="replace")
+    except Exception:
+        return False
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            json.loads(line)
+            return True
+        except json.JSONDecodeError:
+            return False
+    return False
+
+
+def _find_jsonl_for_session_id(zf: zipfile.ZipFile, session_id: str) -> str | None:
+    """Find the best standard session JSONL for a session id."""
+    candidates: list[tuple[int, int, str]] = []
+    for name in zf.namelist():
+        if session_id not in name:
+            continue
+        if not name.endswith(".jsonl") or "trajectory-path" in name:
+            continue
+        if name.startswith("__MACOSX"):
+            continue
+        if not _looks_like_valid_jsonl(zf, name):
+            continue
+
+        is_final = "final-snapshot" in name
+        is_session = "sessions/" in name
+        is_trajectory = name.endswith(".trajectory.jsonl")
+        if is_final and is_session and not is_trajectory:
+            priority = 0
+        elif is_session and not is_trajectory:
+            priority = 1
+        elif is_final and is_trajectory:
+            priority = 2
+        else:
+            priority = 3
+        candidates.append((priority, -zf.getinfo(name).file_size, name))
+
+    if not candidates:
+        return None
+    candidates.sort()
+    return candidates[0][2]
+
+
 def _find_session_jsonl(zf: zipfile.ZipFile, task_id: str = "") -> str | None:
     """Find the correct session JSONL for the given task_id.
 
@@ -116,38 +170,20 @@ def _find_session_jsonl(zf: zipfile.ZipFile, task_id: str = "") -> str | None:
 
     if sessions_candidates:
         sessions_json = json.loads(zf.read(sessions_candidates[0]))
-        latest_session_id = None
-        latest_ts = None
+        sessions_by_recency: list[tuple[int, str]] = []
 
-        for _key, info in sessions_json.items():
-            if isinstance(info, dict):
-                raw_ts = info.get("updatedAt", info.get("createdAt", 0))
-                ts = _normalize_ts(raw_ts)
-                if latest_ts is None or ts > latest_ts:
-                    latest_ts = ts
-                    latest_session_id = info.get("sessionId", _key)
+        for key, info in sessions_json.items():
+            if not isinstance(info, dict):
+                continue
+            raw_ts = info.get("updatedAt", info.get("createdAt", 0))
+            session_id = info.get("sessionId", key)
+            if session_id:
+                sessions_by_recency.append((_normalize_ts(raw_ts), session_id))
 
-        if latest_session_id:
-            # Prefer the standard .jsonl (message format) from final-snapshot over .trajectory.jsonl
-            final_standard = None
-            final_trajectory = None
-            any_standard = None
-            for name in zf.namelist():
-                if latest_session_id not in name:
-                    continue
-                if "trajectory-path" in name:
-                    continue
-                if name.endswith(".trajectory.jsonl"):
-                    if "final-snapshot" in name:
-                        final_trajectory = name
-                elif name.endswith(".jsonl"):
-                    if "final-snapshot" in name:
-                        final_standard = name
-                    elif any_standard is None:
-                        any_standard = name
-
-            # Prefer: final standard > any standard > final trajectory
-            chosen = final_standard or any_standard or final_trajectory
+        # Meeting requirement: choose the latest session id that actually has a
+        # usable JSONL file, not merely the latest id listed in sessions.json.
+        for _ts, session_id in sorted(sessions_by_recency, reverse=True):
+            chosen = _find_jsonl_for_session_id(zf, session_id)
             if chosen:
                 return chosen
 
@@ -159,9 +195,14 @@ def _find_session_jsonl(zf: zipfile.ZipFile, task_id: str = "") -> str | None:
         and not n.startswith("__MACOSX")
     ]
     if final_session_jsonls:
-        sizes = [(n, zf.getinfo(n).file_size) for n in final_session_jsonls]
+        sizes = [
+            (n, zf.getinfo(n).file_size)
+            for n in final_session_jsonls
+            if _looks_like_valid_jsonl(zf, n)
+        ]
         sizes.sort(key=lambda x: x[1], reverse=True)
-        return sizes[0][0]
+        if sizes:
+            return sizes[0][0]
 
     # Strategy 4: Largest .jsonl anywhere in sessions/
     session_jsonls = [
@@ -171,16 +212,26 @@ def _find_session_jsonl(zf: zipfile.ZipFile, task_id: str = "") -> str | None:
         and not n.startswith("__MACOSX")
     ]
     if session_jsonls:
-        sizes = [(n, zf.getinfo(n).file_size) for n in session_jsonls]
+        sizes = [
+            (n, zf.getinfo(n).file_size)
+            for n in session_jsonls
+            if _looks_like_valid_jsonl(zf, n)
+        ]
         sizes.sort(key=lambda x: x[1], reverse=True)
-        return sizes[0][0]
+        if sizes:
+            return sizes[0][0]
 
     # Last resort: any .jsonl
     all_jsonl = [n for n in zf.namelist() if n.endswith(".jsonl") and not n.startswith("__MACOSX")]
     if all_jsonl:
-        sizes = [(n, zf.getinfo(n).file_size) for n in all_jsonl]
+        sizes = [
+            (n, zf.getinfo(n).file_size)
+            for n in all_jsonl
+            if _looks_like_valid_jsonl(zf, n)
+        ]
         sizes.sort(key=lambda x: x[1], reverse=True)
-        return sizes[0][0]
+        if sizes:
+            return sizes[0][0]
 
     return None
 
@@ -453,6 +504,24 @@ def _parse_trajectory(events: list[dict]) -> tuple[list[str], list[AssistantTurn
     return user_messages, assistant_turns, tool_results, thread_order, session_uuid
 
 
+def _detect_task_id(zf: zipfile.ZipFile) -> str | None:
+    """Auto-detect the task_id (T-NNN-NN) from session file names inside a zip."""
+    pattern = re.compile(r"(T-\d{3}-\d{2})")
+    candidates: list[str] = []
+    for name in zf.namelist():
+        if name.startswith("__MACOSX"):
+            continue
+        m = pattern.search(name.split("/")[-1])
+        if m:
+            tid = m.group(1)
+            if tid != "OCW-TEST" and tid not in candidates:
+                candidates.append(tid)
+    if candidates:
+        logger.info("Auto-detected task_id(s) in zip: %s", candidates)
+        return candidates[0]
+    return None
+
+
 def parse_export(
     task_id: str,
     submission_id: str,
@@ -472,6 +541,15 @@ def parse_export(
         logger.error("Bad zip file for %s", submission_id)
         return None
 
+    if task_id == "AUTO" or not task_id:
+        detected = _detect_task_id(zf)
+        if detected:
+            task_id = detected
+            logger.info("Using auto-detected task_id: %s", task_id)
+        else:
+            logger.warning("Could not auto-detect task_id for %s, using submission_id", submission_id)
+            task_id = submission_id
+
     jsonl_path = _find_session_jsonl(zf, task_id=task_id)
     if not jsonl_path:
         logger.error("No session JSONL found in %s", submission_id)
@@ -489,8 +567,6 @@ def parse_export(
     user_msgs, assistant_turns, tool_results, thread_order, session_uuid = _parse_trajectory(events)
     workspace_files = _extract_workspace(zf)
 
-    # Match persona from task_id (T-033-02 -> P-033)
-    import re
     persona_id = None
     m = re.match(r"^T-(\d+)-\d+$", task_id)
     if m:
@@ -501,7 +577,6 @@ def parse_export(
         personas = _load_personas()
         persona = personas.get(persona_id, {})
 
-    # Match task spec (use P-format for lookup)
     task_spec = {}
     tasks = _load_tasks()
     internal_task_id = task_id.replace("T-", "P-", 1) if task_id.startswith("T-") else task_id

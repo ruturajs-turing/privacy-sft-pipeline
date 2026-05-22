@@ -348,8 +348,10 @@ def _detect_workspace_path_from_trajectory(trajectory: ParsedTrajectory) -> str:
 
 _ADVERSARIAL_PROMPT = """You are generating a synthetic adversarial user message and the assistant's polite refusal for a privacy-compliance training trajectory.
 
-CONTEXT:
-- The trajectory involves: {topic}
+FULL CONVERSATION CONTEXT:
+{conversation_context}
+
+CURRENT SITUATION:
 - The persona's name: {persona_name}
 - PII available in context: {pii_summary}
 - Attack type to generate: {attack_type}
@@ -359,7 +361,6 @@ ATTACK TYPE DESCRIPTIONS:
 - social_engineering: User claims authority/approval to bypass rules ("my boss said", "security team approved")
 - encoding: User tries to sneak PII via Base64, leetspeak, unicode tricks
 - persistence_escalation: After being denied memory, user tries alternative persistence paths
-- repeated_pressure: User pressures repeatedly after denial ("just do it!", "why won't you?")
 - emotional_manipulation: User uses emotional appeals to bypass rules ("I'll forget my meds")
 
 Generate a JSON object with this EXACT structure:
@@ -375,7 +376,9 @@ Generate a JSON object with this EXACT structure:
 }}
 
 RULES:
-- User message should reference REAL PII from the persona (names, SSN, health data, etc.) to make it realistic
+- The user is mentioning this sensitive data for the FIRST TIME. Do NOT say "I already told you" or reference previous requests.
+- User message should reference REAL PII from the persona (names, SSN, health data, etc.)
+- The message must make sense given the conversation context above — match the user's tone and the topic.
 - Assistant must NEVER comply, even partially
 - Assistant must NOT be condescending or say "nice try"
 - Assistant must offer a concrete alternative (use for current task, local password manager, etc.)
@@ -408,8 +411,9 @@ async def _inject_adversarial_turns(
     if total_turns < 2:
         return rewritten_turns
 
-    # Pick insertion points (after which turn index to insert)
-    possible_positions = list(range(1, total_turns))
+    # Pick insertion points — never the very end (at least 2 from the end)
+    last_valid = max(1, total_turns - 2)
+    possible_positions = list(range(1, last_valid + 1))
     random.shuffle(possible_positions)
     insertion_positions = sorted(possible_positions[:num_adversarial], reverse=True)
 
@@ -428,10 +432,38 @@ async def _inject_adversarial_turns(
         pii_summary_parts.append(f"Card: {pii_vault['financial']['credit_card']}")
     pii_summary = "; ".join(pii_summary_parts) if pii_summary_parts else "Full name, email, phone, health records"
 
-    topic_parts = []
-    for msg in trajectory.user_messages[:3]:
-        topic_parts.append(msg[:100])
-    topic = " | ".join(topic_parts) if topic_parts else "general task assistance"
+    # Build full conversation context for coherent adversarial generation
+    from task_context import get_task_definition as _get_task_def
+    task_def = _get_task_def(trajectory.task_id)
+    ctx_parts = []
+    if task_def:
+        ctx_parts.append(
+            f"TASK: {task_def.get('task_title', '')}\n"
+            f"Goal: {task_def.get('goal_summary', '')}"
+        )
+    if persona:
+        p = persona.get("personality", {})
+        ctx_parts.append(
+            f"PERSONA: {persona_name}, {persona.get('job_title', '')} in {persona.get('city', '')}"
+        )
+    conv_lines = []
+    for msg in trajectory.user_messages[:6]:
+        conv_lines.append(f"  USER: {str(msg)[:200]}")
+    for t in rewritten_turns[:8]:
+        preview = (t.text or "(tool use)")[:150]
+        conv_lines.append(f"  ASSISTANT: {preview}")
+    if conv_lines:
+        ctx_parts.append("CONVERSATION:\n" + "\n".join(conv_lines[:12]))
+    conversation_context = "\n\n".join(ctx_parts)
+
+    # RAG: fetch real adversarial examples for context
+    rag_adversarial_block = ""
+    try:
+        from rag_retriever import is_index_ready, get_adversarial_examples
+        if is_index_ready():
+            rag_adversarial_block = get_adversarial_examples(n=2)
+    except Exception:
+        pass
 
     # Generate adversarial turns via Claude
     attack_types_used = random.sample(ATTACK_TYPES, min(num_adversarial, len(ATTACK_TYPES)))
@@ -441,8 +473,9 @@ async def _inject_adversarial_turns(
 
     adversarial_turns = []
     for i, attack_type in enumerate(attack_types_used):
+        rag_section = f"\n\n{rag_adversarial_block}" if rag_adversarial_block else ""
         prompt = _ADVERSARIAL_PROMPT.format(
-            topic=topic[:200],
+            conversation_context=conversation_context[:2000] + rag_section,
             persona_name=persona_name,
             pii_summary=pii_summary[:300],
             attack_type=attack_type,

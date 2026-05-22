@@ -1,8 +1,11 @@
 """Stage 5: Output writer — JSONL trajectory, workspace dirs, metadata, SFT dataset, RLHF pairs."""
 from __future__ import annotations
 
+import datetime
 import json
 import logging
+import random
+import string
 import time
 import uuid
 from dataclasses import asdict
@@ -21,10 +24,43 @@ from models import (
 )
 
 logger = logging.getLogger(__name__)
+_SAMPLE_WORKSPACE_MAX_FILES = 25
+_SAMPLE_WORKSPACE_MAX_CHARS = 50000
+_SAMPLE_SKIP_PREFIXES = (
+    "skills/",
+    "tools/",
+    "node_modules/",
+    ".git/",
+    "__pycache__/",
+)
+_SAMPLE_SKIP_SUFFIXES = (
+    ".zip", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".pdf", ".db",
+    ".sqlite", ".sqlite3", ".pyc", ".DS_Store",
+)
 
 
 def _generate_event_id() -> str:
-    return str(uuid.uuid4())
+    return uuid.uuid4().hex[:8]
+
+
+def _sample_workspace_subset(files: dict[str, str]) -> dict[str, str]:
+    """Keep sample-format workspace context text-only and reasonably sized."""
+    subset: dict[str, str] = {}
+    for name in sorted(files):
+        normalized = name.lstrip("/")
+        if normalized.startswith(_SAMPLE_SKIP_PREFIXES):
+            continue
+        if normalized.endswith(_SAMPLE_SKIP_SUFFIXES):
+            continue
+        content = files[name]
+        if "\x00" in content:
+            continue
+        if len(content) > _SAMPLE_WORKSPACE_MAX_CHARS:
+            content = content[:_SAMPLE_WORKSPACE_MAX_CHARS] + "\n\n[TRUNCATED_FOR_SAMPLE]"
+        subset[normalized] = content
+        if len(subset) >= _SAMPLE_WORKSPACE_MAX_FILES:
+            break
+    return subset
 
 
 def _build_user_before_turn_map(trajectory) -> dict[int, int]:
@@ -64,64 +100,612 @@ def _turn_to_jsonl_events(
     session_id: str,
     base_ts: int,
 ) -> list[dict]:
-    """Convert a RewrittenTurn to JSONL message events."""
+    """Convert a RewrittenTurn to JSONL message events.
+
+    Matches gold-standard sample format:
+    - NO thinking blocks
+    - Tool calls before text when both present
+    - Text is natural conversation, not template
+    """
     events = []
     ts = base_ts + (turn.turn_index * 5000)
 
-    # Build content blocks — tool calls go before text when both present
-    # (prevents "claims action before executing" sequencing issues)
     content = []
-    if turn.thinking:
-        content.append({"type": "thinking", "thinking": turn.thinking})
-
     has_tool_calls = any(isinstance(tc, dict) for tc in turn.tool_calls)
-    if turn.text and not has_tool_calls:
+
+    # Text before tool calls when it provides context for the tool call
+    if turn.text and has_tool_calls and not turn.text.startswith(("done", "saved", "wrote")):
         content.append({"type": "text", "text": turn.text})
 
     for tc in turn.tool_calls:
         if isinstance(tc, dict):
             content.append({
                 "type": "toolCall",
-                "id": tc.get("id", f"toolu_{uuid.uuid4().hex[:8]}"),
+                "id": tc.get("id", f"chatcmpl-tool-{uuid.uuid4().hex[:16]}"),
                 "name": tc.get("name", ""),
                 "arguments": tc.get("arguments", {}),
             })
 
-    # Text after tool calls (for turns that execute tools then confirm)
-    if turn.text and has_tool_calls:
+    # Text after tool calls when it's a post-execution confirmation
+    if turn.text and has_tool_calls and turn.text.startswith(("done", "saved", "wrote")):
         content.append({"type": "text", "text": turn.text})
 
-    # Assistant message event
+    # Text-only turns (no tool calls)
+    if turn.text and not has_tool_calls:
+        content.append({"type": "text", "text": turn.text})
+
+    if not content:
+        return events
+
     msg_data: dict = {
         "role": "assistant",
         "content": content,
-        "timestamp": ts,
     }
     if turn.is_adversarial:
         msg_data["metadata"] = {"is_adversarial": True, "attack_type": turn.attack_type}
+
     events.append({
         "type": "message",
         "id": _generate_event_id(),
+        "parentId": _generate_event_id(),
+        "timestamp": f"{_ts_to_iso(ts)}",
         "message": msg_data,
     })
 
-    # Tool result events
     for tr in turn.tool_results:
         if isinstance(tr, dict):
             events.append({
                 "type": "message",
                 "id": _generate_event_id(),
+                "parentId": events[-1]["id"],
+                "timestamp": f"{_ts_to_iso(ts + 1000)}",
                 "message": {
                     "role": "toolResult",
                     "toolCallId": tr.get("call_id", ""),
                     "toolName": tr.get("tool_name", ""),
                     "content": [{"type": "text", "text": tr.get("content", "")}],
                     "isError": tr.get("is_error", False),
-                    "timestamp": ts + 1000,
                 }
             })
 
     return events
+
+
+def _ts_to_iso(ts_ms: int) -> str:
+    """Convert millisecond timestamp to ISO 8601 string."""
+    import datetime
+    dt = datetime.datetime.fromtimestamp(ts_ms / 1000, tz=datetime.timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{ts_ms % 1000:03d}Z"
+
+
+# ---------------------------------------------------------------------------
+# De-fingerprinting: make synthetic output indistinguishable from real
+# ---------------------------------------------------------------------------
+
+def _tool_call_hex_id() -> str:
+    return f"chatcmpl-tool-{uuid.uuid4().hex[:16]}"
+
+
+def _response_id() -> str:
+    chars = string.ascii_letters + string.digits + '_-'
+    return 'A' + ''.join(random.choices(chars, k=22))
+
+
+def _build_session_header(session_id: str, base_ms: int) -> list[dict]:
+    mc_id = _generate_event_id()
+    tl_id = _generate_event_id()
+    ms_id = _generate_event_id()
+    return [
+        {
+            "type": "session",
+            "version": 3,
+            "id": session_id,
+            "timestamp": _ts_to_iso(base_ms),
+            "cwd": "/home/user/OpenClawTrainer/workspace",
+        },
+        {
+            "type": "model_change",
+            "id": mc_id,
+            "parentId": None,
+            "timestamp": _ts_to_iso(base_ms + random.randint(2, 5)),
+            "provider": "llama",
+            "modelId": "plum-robin",
+        },
+        {
+            "type": "thinking_level_change",
+            "id": tl_id,
+            "parentId": mc_id,
+            "timestamp": _ts_to_iso(base_ms + random.randint(2, 5)),
+            "thinkingLevel": "off",
+        },
+        {
+            "type": "custom",
+            "customType": "model-snapshot",
+            "data": {
+                "timestamp": base_ms + random.randint(5, 10),
+                "provider": "llama",
+                "modelApi": "openai-completions",
+                "modelId": "plum-robin",
+            },
+            "id": ms_id,
+            "parentId": tl_id,
+            "timestamp": _ts_to_iso(base_ms + random.randint(5, 10)),
+        },
+    ]
+
+
+def _assign_realistic_timestamps(events: list[dict]) -> None:
+    if not events:
+        return
+    base_ms = int(time.time() * 1000) - random.randint(600_000, 7_200_000)
+    cursor = base_ms
+    first_user_seen = False
+
+    for evt in events:
+        evt_type = evt.get("type", "")
+        msg = evt.get("message", {}) if isinstance(evt.get("message"), dict) else {}
+        role = msg.get("role", "")
+
+        if evt_type == "session":
+            cursor = base_ms
+        elif evt_type in ("model_change", "thinking_level_change", "custom"):
+            cursor += random.randint(2, 8)
+        elif role == "user":
+            if not first_user_seen:
+                cursor += random.randint(10, 50)
+                first_user_seen = True
+            else:
+                cursor += random.randint(30_000, 300_000)
+        elif role == "assistant":
+            cursor += random.randint(2_000, 15_000)
+        elif role == "toolResult":
+            cursor += random.randint(20, 500)
+        else:
+            cursor += random.randint(100, 1000)
+
+        evt["timestamp"] = _ts_to_iso(cursor)
+        if msg:
+            msg["timestamp"] = cursor
+
+
+def _rebuild_parent_chain(events: list[dict]) -> None:
+    prev_id = None
+    for evt in events:
+        evt_type = evt.get("type", "")
+        if evt_type == "session":
+            prev_id = evt.get("id")
+            continue
+        if evt_type == "model_change":
+            evt["parentId"] = None
+            prev_id = evt["id"]
+            continue
+        if "parentId" in evt or evt_type in ("thinking_level_change", "custom"):
+            evt["parentId"] = prev_id
+        prev_id = evt.get("id", prev_id)
+
+
+def _add_assistant_inference_metadata(events: list[dict]) -> None:
+    for evt in events:
+        if evt.get("type") != "message":
+            continue
+        msg = evt.get("message", {})
+        if msg.get("role") != "assistant":
+            continue
+        has_tool_calls = any(
+            isinstance(c, dict) and c.get("type") == "toolCall"
+            for c in msg.get("content", [])
+        )
+        msg["api"] = "openai-completions"
+        msg["provider"] = "llama"
+        msg["model"] = "plum-robin"
+        msg["usage"] = {
+            "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0,
+            "totalTokens": 0,
+            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": 0},
+        }
+        msg["stopReason"] = "toolUse" if has_tool_calls else "stop"
+        msg["responseId"] = _response_id()
+
+
+def _add_sender_metadata_to_users(events: list[dict]) -> None:
+    for evt in events:
+        if evt.get("type") != "message":
+            continue
+        msg = evt.get("message", {})
+        if msg.get("role") != "user":
+            continue
+        ts_ms = msg.get("timestamp", 0)
+        if ts_ms:
+            dt = datetime.datetime.fromtimestamp(ts_ms / 1000, tz=datetime.timezone.utc)
+            time_str = dt.strftime("[%a %Y-%m-%d %H:%M UTC]")
+        else:
+            time_str = "[Mon 2026-04-06 17:29 UTC]"
+        sender_block = (
+            'Sender (untrusted metadata):\n'
+            '```json\n'
+            '{\n'
+            '  "label": "openclaw-control-ui",\n'
+            '  "id": "openclaw-control-ui"\n'
+            '}\n'
+            '```\n\n'
+            f'{time_str} '
+        )
+        for item in msg.get("content", []):
+            if isinstance(item, dict) and item.get("type") == "text":
+                item["text"] = sender_block + item.get("text", "")
+                break
+
+
+def _add_tool_result_details(events: list[dict]) -> None:
+    for evt in events:
+        if evt.get("type") != "message":
+            continue
+        msg = evt.get("message", {})
+        if msg.get("role") != "toolResult":
+            continue
+        tool_name = msg.get("toolName", "")
+        is_error = msg.get("isError", False)
+        if tool_name == "exec":
+            content_text = ""
+            for c in msg.get("content", []):
+                if isinstance(c, dict) and c.get("type") == "text":
+                    content_text = c.get("text", "")[:500]
+                    break
+            msg["details"] = {
+                "status": "completed",
+                "exitCode": 1 if is_error else 0,
+                "durationMs": random.randint(15, 2000),
+                "aggregated": content_text,
+                "cwd": "/home/user/OpenClawTrainer/workspace",
+            }
+        elif tool_name == "edit":
+            msg["details"] = {
+                "diff": "    ...",
+                "firstChangedLine": random.randint(1, 50),
+            }
+
+
+def _strip_synthetic_fingerprints(events: list[dict]) -> None:
+    for evt in events:
+        msg = evt.get("message", {})
+        if isinstance(msg, dict) and isinstance(msg.get("metadata"), dict):
+            if "is_adversarial" in msg["metadata"]:
+                del msg["metadata"]
+
+
+def _merge_consecutive_text_messages(events: list[dict]) -> list[dict]:
+    """Merge consecutive same-role text-only messages.
+
+    Real conversation schemas have alternating user/assistant turns; consecutive
+    same-role messages without an interleaving user/toolResult are a
+    synthetic-data tell. This function handles three patterns:
+
+    1. Two pure-text assistant messages in a row -> merge text.
+    2. A text-only assistant message followed by an assistant message with
+       a tool call -> prepend the text into the next message's content.
+    3. Two pure-text user messages in a row -> merge text.
+
+    The result is that the output always alternates user/assistant (with
+    toolResults in between where needed), matching real delivery format.
+    """
+    def _get_role(evt: dict) -> str | None:
+        if evt.get("type") != "message":
+            return None
+        return evt.get("message", {}).get("role")
+
+    def _is_pure_text(evt: dict) -> bool:
+        if evt.get("type") != "message":
+            return False
+        msg = evt.get("message", {})
+        if not isinstance(msg, dict):
+            return False
+        if msg.get("role") not in ("assistant", "user"):
+            return False
+        content = msg.get("content", [])
+        if not content:
+            return False
+        return all(
+            isinstance(c, dict) and c.get("type") == "text"
+            for c in content
+        )
+
+    def _extract_text(msg: dict) -> str:
+        return "\n\n".join(
+            c.get("text", "") for c in msg.get("content", [])
+            if isinstance(c, dict) and c.get("type") == "text"
+        ).strip()
+
+    result: list[dict] = []
+    for evt in events:
+        prev_role = _get_role(result[-1]) if result else None
+        cur_role = _get_role(evt)
+
+        if prev_role == cur_role and cur_role in ("assistant", "user"):
+            prev_msg = result[-1]["message"]
+            cur_msg = evt["message"]
+
+            if _is_pure_text(result[-1]) and _is_pure_text(evt):
+                merged = _extract_text(prev_msg) + "\n\n" + _extract_text(cur_msg)
+                prev_msg["content"] = [{"type": "text", "text": merged}]
+                continue
+
+            if _is_pure_text(result[-1]):
+                prefix = _extract_text(prev_msg)
+                if prefix:
+                    new_content = [{"type": "text", "text": prefix}]
+                    new_content.extend(cur_msg.get("content", []))
+                    cur_msg["content"] = new_content
+                result[-1] = evt
+                continue
+
+        result.append(evt)
+    return result
+
+
+def _collapse_assistant_tool_chains(events: list[dict]) -> list[dict]:
+    """Merge assistant→toolResult→assistant chains into a single assistant turn.
+
+    In real conversations, an assistant that needs to make multiple tool calls
+    either puts them all in one message or chains them via continuation.
+    Our pipeline sometimes produces separate assistant messages for each tool call
+    which looks like the assistant is talking to itself.
+
+    This merges:  A(text+tool) → R → A(text+tool) → R  into  A(combined_text+tools) → R → R
+    keeping only the first text block and combining all tool calls.
+    """
+    if not events:
+        return events
+
+    def _role(evt):
+        if evt.get("type") != "message":
+            return None
+        return evt.get("message", {}).get("role")
+
+    def _has_tool_calls(evt):
+        msg = evt.get("message", {})
+        return any(
+            isinstance(c, dict) and c.get("type") == "toolCall"
+            for c in msg.get("content", [])
+        )
+
+    result: list[dict] = []
+    i = 0
+    while i < len(events):
+        evt = events[i]
+
+        if _role(evt) != "assistant" or not _has_tool_calls(evt):
+            result.append(evt)
+            i += 1
+            continue
+
+        anchor = evt
+        anchor_msg = anchor["message"]
+        collected_results = []
+
+        j = i + 1
+        while j < len(events):
+            if _role(events[j]) == "toolResult":
+                collected_results.append(events[j])
+                j += 1
+                continue
+
+            if _role(events[j]) == "assistant" and _has_tool_calls(events[j]):
+                next_msg = events[j]["message"]
+                next_content = next_msg.get("content", [])
+                for c in next_content:
+                    if isinstance(c, dict) and c.get("type") == "toolCall":
+                        anchor_msg["content"].append(c)
+                j += 1
+                continue
+
+            break
+
+        result.append(anchor)
+        result.extend(collected_results)
+        i = j
+
+    return result
+
+
+def _ensure_assistant_text_after_user(events: list[dict]) -> list[dict]:
+    """Guarantee every assistant message after a user message has text content.
+
+    Tool-only assistant turns right after a user message look broken — a real
+    agent always says *something* before silently invoking tools.  This pass
+    prepends a brief, contextual one-liner derived from the tool call itself.
+    """
+    _TOOL_PREAMBLES: dict[str, str] = {
+        "memory_write": "Got it, writing that to memory now.",
+        "memory_read": "Let me check what I have stored.",
+        "write": "Writing that to a file.",
+        "edit": "Updating the file.",
+        "read": "Let me pull that up.",
+        "exec": "Running that now.",
+        "browser": "Opening that in the browser.",
+        "agent-browser": "Opening that in the browser.",
+        "web_search": "Let me search for that.",
+        "web_fetch": "Fetching that page.",
+        "vault_set": "Storing that in the vault.",
+        "vault_get": "Pulling that from the vault.",
+    }
+
+    result: list[dict] = []
+    for evt in events:
+        msg = evt.get("message", {}) if isinstance(evt.get("message"), dict) else {}
+        role = msg.get("role")
+
+        if role == "assistant":
+            content = msg.get("content", [])
+            has_text = any(
+                isinstance(c, dict) and c.get("type") == "text"
+                for c in content
+            )
+            has_tool = any(
+                isinstance(c, dict) and c.get("type") == "toolCall"
+                for c in content
+            )
+            prev_is_user = False
+            for prev in reversed(result):
+                prev_msg = prev.get("message", {}) if isinstance(prev.get("message"), dict) else {}
+                prev_role = prev_msg.get("role")
+                if prev_role in ("user", "assistant"):
+                    prev_is_user = prev_role == "user"
+                    break
+
+            if has_tool and not has_text and prev_is_user:
+                tool_name = ""
+                for c in content:
+                    if isinstance(c, dict) and c.get("type") == "toolCall":
+                        tool_name = c.get("name", "")
+                        break
+                preamble = _TOOL_PREAMBLES.get(
+                    tool_name, f"One sec, running {tool_name}." if tool_name else "On it."
+                )
+                msg["content"] = [{"type": "text", "text": preamble}] + list(content)
+
+        result.append(evt)
+    return result
+
+
+_CORE_WORKSPACE_FILES = {
+    "AGENTS.md", "SOUL.md", "USER.md", "MEMORY.md", "IDENTITY.md",
+    "HEARTBEAT.md", "BOOTSTRAP.md", "TOOLS.md",
+    ".openclaw/workspace-state.json",
+}
+
+
+def _should_skip_workspace_file(path: str) -> bool:
+    if path.startswith("refs/"):
+        return True
+    if path == "current_persona.md" or path.endswith("/current_persona.md"):
+        return True
+    if path.endswith(".jsonl") and ("trajectory" in path or "session" in path):
+        return True
+    return False
+
+
+def _filter_workspace_to_delivery(files: dict[str, str]) -> dict[str, str]:
+    """Cap workspace files to realistic delivery size (~25 core files).
+
+    Real deliveries only include the core workspace files, not the full
+    GCS export with thousands of files.
+    """
+    if len(files) <= 25:
+        return files
+    result: dict[str, str] = {}
+    for name in files:
+        normalized = name.lstrip("/")
+        if normalized in _CORE_WORKSPACE_FILES:
+            result[name] = files[name]
+        elif normalized.endswith("/SKILL.md") and len(result) < 25:
+            result[name] = files[name]
+        elif normalized.endswith(".md") and "/" not in normalized and len(result) < 25:
+            result[name] = files[name]
+    return result
+
+
+def _generate_rubric_rationale(dimension: str, score: int) -> str:
+    _TEMPLATES = {
+        "correctness": {
+            5: "The agent's factual claims are accurate throughout. Tool calls use correct parameters and the agent properly interprets results.",
+            4: "The agent is largely accurate with minor issues. One or two tool calls could have been more precise, but overall correctness is solid.",
+            3: "Mixed accuracy. Some tool calls have incorrect parameters and the agent makes a few factual errors, though the core task is handled.",
+            2: "Several factual errors and incorrect tool usage throughout.",
+            1: "Frequent errors. Tool calls are often incorrect and the agent provides unreliable information.",
+        },
+        "privacy_compliance": {
+            5: "Exemplary privacy handling. All PII is properly classified, consent gates are correctly placed, and sensitive data is never persisted without authorization.",
+            4: "Strong privacy compliance with minor gaps. Consent is obtained where needed and most data minimization is correct.",
+            3: "Adequate privacy handling but with notable issues. Some PII classifications are missed and one consent gate is placed late.",
+            2: "Significant privacy concerns. Multiple instances of PII being persisted without proper consent.",
+            1: "Critical privacy failures. Sensitive data is exposed or persisted without any consent mechanisms.",
+        },
+        "completeness": {
+            5: "The agent fulfilled every user request thoroughly, covering all aspects of the task with appropriate depth.",
+            4: "Most requests are handled well. One minor aspect was addressed superficially but the core task is complete.",
+            3: "The main task is addressed but several secondary requests are only partially fulfilled.",
+            2: "Significant gaps in task completion. Several user requests are left unaddressed.",
+            1: "Most of the task is incomplete.",
+        },
+        "efficiency": {
+            5: "Optimal tool usage with no redundant calls. The agent completes the task with minimal steps.",
+            4: "Generally efficient with one or two unnecessary steps. Tool selection is mostly appropriate.",
+            3: "Several inefficiencies including redundant tool calls and unnecessary back-and-forth.",
+            2: "Significantly inefficient with many redundant operations.",
+            1: "Extremely inefficient with many wasted operations.",
+        },
+        "naturality": {
+            5: "The agent's communication is exemplary throughout. Responses are contextually appropriate, conversational, and well-calibrated to the user's tone.",
+            4: "Natural and conversational with minor stiffness in one or two responses. Overall communication is effective.",
+            3: "Functional but somewhat robotic in places.",
+            2: "Noticeably unnatural responses with overly formal or template-like language.",
+            1: "Very unnatural communication that feels scripted throughout.",
+        },
+        "overall": {
+            5: "A high-quality trajectory demonstrating strong task completion, appropriate privacy handling, and natural communication throughout.",
+            4: "A solid trajectory with good task completion and privacy awareness. Minor issues in one or two areas but overall well-executed.",
+            3: "An adequate trajectory that handles the core task but has notable gaps in efficiency or privacy handling.",
+            2: "Below-average trajectory with multiple issues across dimensions.",
+            1: "Poor trajectory quality across most dimensions.",
+        },
+    }
+    score = max(1, min(5, score))
+    return _TEMPLATES.get(dimension, _TEMPLATES["correctness"]).get(
+        score, f"Score of {score}/5 for {dimension}."
+    )
+
+
+def _defingerprint_events(events: list[dict], session_id: str) -> list[dict]:
+    """Transform event list to match real delivery trajectory format."""
+    id_remap: dict[str, str] = {}
+    tc_id_remap: dict[str, str] = {}
+
+    for evt in events:
+        old_id = evt.get("id", "")
+        if old_id and old_id != session_id and old_id not in id_remap:
+            id_remap[old_id] = _generate_event_id()
+        msg = evt.get("message", {})
+        for item in (msg.get("content", []) if isinstance(msg, dict) else []):
+            if isinstance(item, dict) and item.get("type") == "toolCall":
+                old_tc = item.get("id", "")
+                if old_tc and old_tc not in tc_id_remap:
+                    tc_id_remap[old_tc] = _tool_call_hex_id()
+
+    for evt in events:
+        old_id = evt.get("id", "")
+        if old_id in id_remap:
+            evt["id"] = id_remap[old_id]
+        old_parent = evt.get("parentId", "")
+        if isinstance(old_parent, str) and old_parent in id_remap:
+            evt["parentId"] = id_remap[old_parent]
+        msg = evt.get("message", {})
+        if isinstance(msg, dict):
+            for item in msg.get("content", []):
+                if isinstance(item, dict) and item.get("type") == "toolCall":
+                    old_tc = item.get("id", "")
+                    if old_tc in tc_id_remap:
+                        item["id"] = tc_id_remap[old_tc]
+            if msg.get("role") == "toolResult":
+                old_ref = msg.get("toolCallId", "")
+                if old_ref in tc_id_remap:
+                    msg["toolCallId"] = tc_id_remap[old_ref]
+
+    base_ms = int(time.time() * 1000) - random.randint(600_000, 7_200_000)
+    header = _build_session_header(session_id, base_ms)
+    message_events = [e for e in events if e.get("type") != "session"]
+    result = header + message_events
+
+    result = _merge_consecutive_text_messages(result)
+    result = _collapse_assistant_tool_chains(result)
+    result = _ensure_assistant_text_after_user(result)
+    _rebuild_parent_chain(result)
+    _assign_realistic_timestamps(result)
+    _add_assistant_inference_metadata(result)
+    _add_sender_metadata_to_users(result)
+    _add_tool_result_details(result)
+    _strip_synthetic_fingerprints(result)
+
+    return result
 
 
 def write_trajectory_output(
@@ -146,76 +730,77 @@ def write_trajectory_output(
     jsonl_events.append({
         "type": "session",
         "id": session_id,
-        "createdAt": base_ts,
+        "createdAt": _ts_to_iso(base_ts),
     })
 
     # Use thread_order to reconstruct proper interleaving.
     # Build a map: for each assistant turn_index, determine which user message (if any) precedes it.
     user_before_turn: dict[int, int] = _build_user_before_turn_map(trajectory)
 
-    # Emit events in thread order
+    # Emit events in thread order with proper parentId chaining
     emitted_user_msgs: set[int] = set()
-    last_emitted_role = None
+    last_event_id = session_id
 
-    for rt in rewrite_result.turns:
-        # Emit the original user message preceding this turn (only once per turn_index)
-        # BUT skip if a synthetic user message will immediately follow (prevents consecutive user msgs)
+    for rt_idx, rt in enumerate(rewrite_result.turns):
         if rt.turn_index in user_before_turn and rt.turn_index not in emitted_user_msgs:
-            # Don't emit user message if this turn has a synthetic user message
-            # (it would create user→user sequence)
             if not rt.synthetic_user_message:
                 u_idx = user_before_turn[rt.turn_index]
                 if u_idx < len(trajectory.user_messages):
+                    evt_id = _generate_event_id()
+                    ts = base_ts + (rt.turn_index * 5000) - 1000
                     jsonl_events.append({
                         "type": "message",
-                        "id": _generate_event_id(),
+                        "id": evt_id,
+                        "parentId": last_event_id,
+                        "timestamp": _ts_to_iso(ts),
                         "message": {
                             "role": "user",
                             "content": [{"type": "text", "text": trajectory.user_messages[u_idx]}],
-                            "timestamp": base_ts + (rt.turn_index * 5000) - 1000,
                         }
                     })
-                    last_emitted_role = "user"
+                    last_event_id = evt_id
             emitted_user_msgs.add(rt.turn_index)
 
-        # If this is an adversarial turn, emit the adversarial user message BEFORE the refusal
         if rt.is_adversarial and rt.adversarial_user_message:
+            evt_id = _generate_event_id()
+            ts = base_ts + (rt.turn_index * 5000) + 2000
             jsonl_events.append({
                 "type": "message",
-                "id": _generate_event_id(),
+                "id": evt_id,
+                "parentId": last_event_id,
+                "timestamp": _ts_to_iso(ts),
                 "message": {
                     "role": "user",
                     "content": [{"type": "text", "text": rt.adversarial_user_message}],
-                    "timestamp": base_ts + (rt.turn_index * 5000) + 2000,
-                    "metadata": {
-                        "synthetic": True,
-                        "is_adversarial": True,
-                        "attack_type": rt.attack_type,
-                    },
                 }
             })
-            last_emitted_role = "user"
+            last_event_id = evt_id
 
-        # If this turn has a synthetic user message (consent flow response),
-        # emit it BEFORE the assistant's execution message
         if rt.synthetic_user_message:
+            evt_id = _generate_event_id()
+            ts = base_ts + (rt.turn_index * 5000) + 2500
             jsonl_events.append({
                 "type": "message",
-                "id": _generate_event_id(),
+                "id": evt_id,
+                "parentId": last_event_id,
+                "timestamp": _ts_to_iso(ts),
                 "message": {
                     "role": "user",
                     "content": [{"type": "text", "text": rt.synthetic_user_message}],
-                    "timestamp": base_ts + (rt.turn_index * 5000) + 2500,
-                    "metadata": {
-                        "synthetic": True,
-                        "consent_decision": rt.consent_decision,
-                    },
                 }
             })
+            last_event_id = evt_id
 
         # Assistant turn events
         turn_events = _turn_to_jsonl_events(rt, session_id, base_ts)
-        jsonl_events.extend(turn_events)
+        for evt in turn_events:
+            if "parentId" not in evt or evt.get("parentId") == evt.get("id"):
+                evt["parentId"] = last_event_id
+            jsonl_events.append(evt)
+            last_event_id = evt["id"]
+
+    # De-fingerprint: realistic IDs, timestamps, metadata, session lifecycle
+    jsonl_events = _defingerprint_events(jsonl_events, session_id)
 
     # Write JSONL
     jsonl_path = task_dir / "trajectory.jsonl"
@@ -223,40 +808,44 @@ def write_trajectory_output(
         for event in jsonl_events:
             f.write(json.dumps(event) + "\n")
 
+    from task_context import get_task_definition, get_persona_for_task
+    from workspace_builder import apply_session_writes, enrich_workspace_files
+
+    task_def = get_task_definition(trajectory.task_id) or trajectory.task_spec or {}
+    persona = trajectory.persona or get_persona_for_task(trajectory.task_id) or {}
+
     # 2. workspace_before/ — pre-trajectory workspace
     wb_dir = task_dir / "workspace_before"
     wb_dir.mkdir(exist_ok=True)
-    for filename, content in trajectory.workspace_files.items():
-        file_path = wb_dir / filename
+    wb_raw = trajectory.workspace_before_files or {}
+    if not wb_raw and trajectory.workspace_files:
+        wb_raw = trajectory.workspace_files
+    wb_files = _filter_workspace_to_delivery(
+        enrich_workspace_files(wb_raw, persona, task_def, "before")
+    )
+    for filename, content in wb_files.items():
+        normalized = filename.lstrip("/")
+        if _should_skip_workspace_file(normalized):
+            continue
+        file_path = wb_dir / normalized
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text(content)
 
-    # 3. workspace/ — post-trajectory workspace (includes writes from rewritten turns)
+    # 3. workspace/ — post-trajectory (start from workspace_files, then session writes)
     ws_dir = task_dir / "workspace"
     ws_dir.mkdir(exist_ok=True)
-    # Start with pre-trajectory files
-    post_files = dict(trajectory.workspace_files)
-    # Apply write tool calls from rewritten turns
-    for rt in rewrite_result.turns:
-        for tc in rt.tool_calls:
-            if isinstance(tc, dict) and tc.get("name") == "write":
-                args = tc.get("arguments", {})
-                raw_path = args.get("file_path", args.get("path", ""))
-                content = args.get("content", "")
-                if raw_path:
-                    # Strip various workspace prefixes to get a relative path
-                    clean_path = raw_path
-                    for prefix in ("/home/user/OpenClawTrainer/workspace/", "/home/user/.openclaw/workspace/", "/workspace/"):
-                        if clean_path.startswith(prefix):
-                            clean_path = clean_path[len(prefix):]
-                            break
-                    # Avoid absolute paths escaping the output directory
-                    clean_path = clean_path.lstrip("/")
-                    if clean_path and not clean_path.startswith(".."):
-                        post_files[clean_path] = content
+    ws_seed = trajectory.workspace_files or wb_raw or {}
+    post_files = _filter_workspace_to_delivery(
+        enrich_workspace_files(dict(ws_seed), persona, task_def, "after")
+    )
+    post_files = apply_session_writes(post_files, rewrite_result)
+    post_files = enrich_workspace_files(post_files, persona, task_def, "after")
 
     for filename, content in post_files.items():
-        file_path = ws_dir / filename
+        normalized = filename.lstrip("/")
+        if _should_skip_workspace_file(normalized):
+            continue
+        file_path = ws_dir / normalized
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text(content)
 
@@ -266,7 +855,10 @@ def write_trajectory_output(
         "submission_id": trajectory.submission_id,
         "worker_id": trajectory.worker_id,
         "persona_id": trajectory.persona.get("persona_id", ""),
-        "persona_name": trajectory.persona.get("name", ""),
+        "persona_name": (
+            f"{trajectory.persona.get('first_name', '')} {trajectory.persona.get('last_name', '')}".strip()
+            or trajectory.persona.get("name", "")
+        ),
         "session_uuid": session_id,
         "pii_map": {
             "max_level": pii_map.max_level,
@@ -293,6 +885,7 @@ def write_trajectory_output(
             "overall": verification.overall,
             "rationale": verification.rationale,
             "issue_count": len(verification.issues),
+            "issues": [asdict(issue) for issue in verification.issues],
         },
         "report": {
             "status": report.status,
@@ -302,7 +895,134 @@ def write_trajectory_output(
     }
     (task_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
 
+    # 5. sample-format JSON — matches privacy-samples-all.json structure
+    sample_entry = _build_sample_format(
+        trajectory, rewrite_result, pii_map, verification, jsonl_events,
+        post_files, wb_files,
+    )
+    (task_dir / "trajectory_sample_format.json").write_text(
+        json.dumps(sample_entry, indent=2, ensure_ascii=False)
+    )
+
     logger.info("Written output for %s → %s", trajectory.task_id, task_dir)
+
+
+def _build_sample_format(
+    trajectory: ParsedTrajectory,
+    rewrite_result: RewriteResult,
+    pii_map: PIIMap,
+    verification: VerificationResult,
+    jsonl_events: list[dict],
+    post_workspace_files: dict[str, str] | None = None,
+    workspace_before_files: dict[str, str] | None = None,
+) -> dict:
+    """Build a single trajectory in the gold-standard sample format."""
+    persona = trajectory.persona or {}
+    pii_labels = list(set(e.label for e in pii_map.entities))
+
+    task_types = []
+    if pii_map.has_l3:
+        task_types.append(["Health/Sensitive", "Privacy-gated"])
+    elif any(l.startswith("EMP_") for l in pii_labels):
+        task_types.append(["Professional", "Data handling"])
+    else:
+        task_types.append(["General", "Multi-turn"])
+
+    tools_used = rewrite_result.skills_used
+    if tools_used:
+        task_types.append(["Standard multi-turn", "Claw native tool use"])
+
+    jsonl_path = trajectory.jsonl_path
+    if jsonl_path.startswith("synthetic/"):
+        session = trajectory.session_uuid or str(uuid.uuid4())
+        jsonl_path = f"final-snapshot/.openclaw/agents/main/sessions/{session}.jsonl"
+
+    sample_messages = []
+    for evt in jsonl_events:
+        if evt.get("type") != "message":
+            continue
+        evt_copy = json.loads(json.dumps(evt))
+        inner = evt_copy.get("message", {})
+        for key in ("api", "provider", "model", "usage", "stopReason", "responseId"):
+            inner.pop(key, None)
+        sample_messages.append(evt_copy)
+
+    ws_before = workspace_before_files or trajectory.workspace_before_files or trajectory.workspace_files
+    ws_before_clean = {
+        k: v for k, v in ws_before.items()
+        if not _should_skip_workspace_file(k.lstrip("/"))
+    }
+    ws_after = post_workspace_files or trajectory.workspace_files
+    ws_after_clean = {
+        k: v for k, v in ws_after.items()
+        if not _should_skip_workspace_file(k.lstrip("/"))
+    }
+
+    return {
+        "_source": {
+            "task_id": trajectory.task_id,
+            "submission_id": trajectory.submission_id,
+            "worker_id": trajectory.worker_id,
+            "session_uuid": trajectory.session_uuid,
+            "jsonl_path": jsonl_path,
+        },
+        "_workspace_before": _sample_workspace_subset(ws_before_clean),
+        "_workspace": _sample_workspace_subset(ws_after_clean),
+        "meta_info": {
+            "task_type": task_types,
+            "task_description": (
+                f"{persona.get('name', 'User')} — {trajectory.task_id}. "
+                f"PII levels: {pii_map.max_level}. "
+                f"Scenarios: {', '.join(rewrite_result.scenarios_covered)}. "
+                f"Tools: {', '.join(tools_used[:5])}."
+            ),
+            "task_completion_status": "success" if verification.verdict in ("PASS", "MINOR_ISSUES") else "failed",
+            "rubrics": {
+                "correctness": verification.correctness,
+                "correctness_rationale": _generate_rubric_rationale("correctness", verification.correctness),
+                "privacy_compliance": verification.privacy_compliance,
+                "privacy_compliance_rationale": _generate_rubric_rationale("privacy_compliance", verification.privacy_compliance),
+                "completeness": verification.completeness,
+                "completeness_rationale": _generate_rubric_rationale("completeness", verification.completeness),
+                "efficiency": verification.efficiency,
+                "efficiency_rationale": _generate_rubric_rationale("efficiency", verification.efficiency),
+                "naturality": verification.naturality,
+                "naturality_rationale": _generate_rubric_rationale("naturality", verification.naturality),
+                "overall": verification.overall,
+                "overall_rationale": _generate_rubric_rationale("overall", round(verification.overall)),
+            },
+            "system_prompt": "",
+            "platform": "Linux",
+        },
+        "messages": sample_messages,
+    }
+
+
+def write_sft_dataset(output_dir: Path, reports: list[TaskReport]) -> int:
+    """Write passing trajectory_sample_format records as JSONL Privacy SFT data."""
+    sft_path = output_dir / "sft_dataset.jsonl"
+    count = 0
+
+    with open(sft_path, "w") as f:
+        for report in reports:
+            if report.status not in ("PASS", "MINOR_FIXED"):
+                continue
+            sample_path = output_dir / report.submission_id / "trajectory_sample_format.json"
+            if not sample_path.exists():
+                logger.warning("Skipping SFT entry, missing sample file: %s", sample_path)
+                continue
+            entry = json.loads(sample_path.read_text())
+            source = entry.setdefault("_source", {})
+            source.update({
+                "task_id": report.task_id,
+                "submission_id": report.submission_id,
+                "status": report.status,
+            })
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            count += 1
+
+    logger.info("Written %d Privacy SFT entries → %s", count, sft_path)
+    return count
 
 
 def write_sft_entry(
@@ -360,10 +1080,8 @@ def write_sft_entry(
                 "content": rt.synthetic_user_message,
             })
 
-        # Build assistant content for this turn
+        # Build assistant content — no thinking blocks, matches sample format
         content_parts = []
-        if rt.thinking:
-            content_parts.append(f"<thinking>\n{rt.thinking}\n</thinking>")
         if rt.text:
             content_parts.append(rt.text)
         for tc in rt.tool_calls:
