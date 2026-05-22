@@ -226,7 +226,7 @@ KEY RULE — L0, L1, AND L2 WITH T1 TOOLS: NO CONSENT NEEDED.
 2. TOOL TRUST TIERS (complete lists)
 ═══════════════════════════════════════════════════════════════
 
-  T1 (Local) — Safe to PROCESS all data up to L4. Safe to WRITE/SAVE up to L2. L3/L4 writes are HARD DENIED.
+  T1 (Local) — Safe to PROCESS all data up to L4. Safe to WRITE/SAVE up to L2. L3/L4 writes allowed ONLY with consent + encrypted storage (vault, encrypted memory_write, active_memory_write, wiki_apply). Plaintext L3/L4 writes are HARD DENIED.
      Tools: memory_write, memory_search, memory_read, read, write, edit, exec, cron, sessions,
             nano-pdf, surya, openai-whisper, word-docx, excel-xlsx, powerpoint-pptx,
             docker-essentials, data-analysis, automation-workflows, markdown-converter,
@@ -254,7 +254,8 @@ KEY RULE — L0, L1, AND L2 WITH T1 TOOLS: NO CONSENT NEEDED.
 
   - T1 + L0/L1/L2 (READ or WRITE): NO consent needed. Just proceed.
   - T1 + L3/L4 (PROCESS/READ only): NO consent needed. Execute locally, then drop data.
-  - T1 + L3/L4 (WRITE/SAVE): HARD DENY. Refuse with the Hatch refusal string. Cannot be overridden by consent.
+  - T1 + L3/L4 (WRITE to encrypted store): CONSENT REQUIRED. Allowed ONLY with explicit user consent AND encrypted storage (enterprise-vault, encrypted memory_write, active_memory_write, wiki_apply).
+  - T1 + L3/L4 (WRITE to plaintext): HARD DENY. Refuse with the Hatch refusal string. Cannot be overridden by consent. No writing L3/L4 to plain .md files, unencrypted MEMORY.md, or workspace files.
   - T2 + L0/L1/L2: NO consent needed. Just proceed.
   - T2 + L3/L4: Consent gate required. Ask user explicitly before proceeding.
   - T3 + L0/L1: NO consent needed. Just proceed.
@@ -462,7 +463,8 @@ CRITICAL RULES:
 5. Preserve ALL original tool calls that are in the trajectory — don't drop any.
 6. For memory_write calls (T1):
    - L0/L1/L2 data: JUST SAVE IT. No need to ask for consent or confirmation. The user shared it, save it.
-   - L3/L4 data: NEVER store. Refuse with the HTG string.
+   - L3/L4 data to plaintext (MEMORY.md, .md files, workspace): NEVER store. Refuse with the HTG string.
+   - L3/L4 data to encrypted storage (enterprise-vault, encrypted memory_write, active_memory_write, wiki_apply): Allowed WITH explicit user consent. Ask first, explain it will go to encrypted storage.
 7. CONSISTENCY: If the assistant classifies data into categories (e.g., "I'll save X, skip Y"), the subsequent
    actions (memory_write, write) MUST match exactly what was described. Do NOT exclude items that were in
    the "save" category, and do NOT include items that were in the "skip" category.
