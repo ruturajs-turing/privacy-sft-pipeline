@@ -66,7 +66,8 @@ The authorization matrix determines what's allowed without consent:
 | T3 (external) | Free up to L2 | Free up to L2 |
 
 **Special rules:**
-- T1 write + L3/L4 → **HARD DENY** (any local file, not just memory)
+- T1 write + L3/L4 to **plaintext** (MEMORY.md, .md files, workspace) → **HARD DENY**
+- T1 write + L3/L4 to **encrypted store** (`memory_write` encrypted, `active_memory_write`, `wiki_apply`, `enterprise-vault`) → **CONSENT GATE** (allowed with explicit user consent)
 - T2 + L3/L4 → **CONSENT GATE** (Gate 4b)
 - T3 + L3+ → **CONSENT GATE** (Gate 4c)
 
@@ -75,7 +76,7 @@ The authorization matrix determines what's allowed without consent:
 | Tier | Max Data Level | Example Tools |
 |------|----------------|---------------|
 | T1 Local | L4 (ephemeral only) | `exec`, `read`, `write`, `memory_search`, `vault_get` |
-| T1 Persistence | **L2 max** (L3/L4 HARD DENY) | `memory_write`, `active_memory_write`, `wiki_apply` |
+| T1 Persistence | **L2 free**, L3/L4 with **consent + encrypted store** | `memory_write`, `active_memory_write`, `wiki_apply` |
 | T2 1P Cloud | L2 free (L3+ with consent) | `enterprise-mail`, `enterprise-rag`, `enterprise-database` |
 | T3 3P API | L2 free (L3+ with consent) | `web_search`, `slack`, `notion`, `github`, `gmail` |
 
@@ -96,9 +97,10 @@ L3/L4 data is valid ONLY if the current user turn supplies it, or if the immedia
 
 | Strategy | When Used | Behavior |
 |----------|-----------|----------|
-| **Hard Deny** | L3/L4 write, not reused later | Refuse with Hatch string |
-| **Manual Re-input** | L3/L4 write, reused 1-2x later | Deny + explain user must re-provide |
-| **Vault Redirect** | L3/L4 write, reused 3-4x later | Redirect to `vault_set` encrypted storage |
+| **Hard Deny** | L3/L4 write to plaintext, not reused later | Refuse with Hatch string |
+| **Manual Re-input** | L3/L4 write to plaintext, reused 1-2x later | Deny + explain user must re-provide |
+| **Encrypted Store + Consent** | L3/L4 write via `memory_write`, `active_memory_write`, `wiki_apply` | Ask explicit consent, store in encrypted form only |
+| **Vault Redirect** | L3/L4 write, reused 3-4x later | Redirect to `vault_set` / `enterprise-vault` encrypted storage |
 | **Exception.md** | L3/L4 write, reused 5+ times | Deny + offer documented exception path |
 
 ### Capability-Aware Tool Substitution (Condition 1)
@@ -271,6 +273,7 @@ python rlhf_data_builder.py --submission-id <UUID> --task-id T-002-12
 --resume, -r      Resume from checkpoint
 --dry-run         Parse + classify only (no LLM rewriting)
 --concurrency, -c Max concurrent tasks (default: 8)
+--single-shot     Use single-shot LLM rewrite (recommended, replaces multi-stage assembler)
 --rlhf            Generate RLHF pairs after Privacy SFT output (off by default)
 --no-rlhf         Compatibility flag; keeps RLHF disabled
 ```
@@ -367,4 +370,5 @@ The pipeline enforces quality thresholds before accepting output:
 | Min Tool Calls | >= 3 | Flag as incomplete |
 | Privacy Decision Point | >= 1 required | Flag as lacking privacy content |
 | Structural Integrity | No critical issues | FAIL verdict, manual review |
-| L3/L4 Persistence | Zero tolerance | FAIL verdict, never accepted |
+| L3/L4 Plaintext Persistence | Zero tolerance | FAIL verdict, never accepted |
+| L3/L4 Encrypted Persistence | Requires explicit consent | Allowed via vault/encrypted store only |
