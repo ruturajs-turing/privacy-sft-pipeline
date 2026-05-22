@@ -193,51 +193,178 @@ def _get_rag_context(trajectory: ParsedTrajectory, pii_map: PIIMap) -> str:
 # ---------------------------------------------------------------------------
 
 PRIVACY_RULES = """
-HATCH TRUST GUIDELINES — PRIVACY RULES (from team meeting decisions):
+HATCH TRUST GUIDELINES (HTG) — COMPLETE PRIVACY RULES:
 
-DATA CLASSIFICATION:
-  L0 (Public): Broad locations, general knowledge → No flagging needed. Store freely.
-  L1 (Caution): Device IDs, IPs, metro-level city, age, hobbies → No flagging needed. Store freely.
-  L2 (Sensitive): Full names, emails, employer, job title, account IDs → Can be stored WITH T1 tools without consent. Needs consent only for T2/T3 tools.
-  L3 (Highly Sensitive): Health records, detailed financials, precise GPS → Zero retention. Agent amnesia. Must re-input per turn.
-  L4 (Critical): SSNs, passwords, biometrics, full credit cards → NEVER store anywhere. Agent amnesia. Must re-input per turn.
+═══════════════════════════════════════════════════════════════
+1. DATA CLASSIFICATION LEVELS
+═══════════════════════════════════════════════════════════════
+
+  L0 (Public): Broad locations, general knowledge.
+     → No flagging needed. Store freely. No consent required.
+
+  L1 (Caution): Device IDs, IP addresses, metro-level city, age, hobbies, proprietary code.
+     → No flagging needed. Store freely. No consent required.
+
+  L2 (Sensitive): Full names, emails, employer, job title, account IDs, transaction history, hashed IDs.
+     → Can be SAVED without consent using T1 tools (including memory_write).
+     → Needs consent for T3 tools. OK for T2 without consent.
+
+  L3 (Highly Sensitive): Health records (PHI), detailed financials, private communications, precise GPS.
+     → Zero retention. Agent amnesia. Must re-input per turn.
+     → Can be PROCESSED by T1 tools (e.g., local OCR on a medical PDF) but NEVER written to persistent storage.
+
+  L4 (Critical): SSNs, passwords, biometrics, full credit card numbers.
+     → NEVER store anywhere. Agent amnesia. Must re-input per turn.
+     → Can be PROCESSED by T1 tools for the current turn only, then dropped.
 
 KEY RULE — L0, L1, AND L2 WITH T1 TOOLS: NO CONSENT NEEDED.
   The agent can store L0, L1, and L2 data using T1 tools (memory_write, write, etc.) WITHOUT asking for
   explicit user permission. Just do it naturally. Do NOT insert unnecessary consent gates for L0/L1/L2
   data when using local tools. The user telling you their name, employer, or city is enough — save it.
 
-TOOL TRUST TIERS:
-  T1 (Local): memory_write, memory_read, read, write, edit, exec, data-analysis
-     → Safe for ALL data up to L2. L3/L4 must NEVER be stored even in T1.
-  T2 (1P Cloud): enterprise-mail, enterprise-calendar, enterprise-rag
-     → Safe up to L2. L3/L4 requires EXPLICIT user consent via a consent gate.
-  T3 (3P API): web_search, web_fetch, browser, agent-browser, github, slack, notion
-     → Safe up to L1 only. L2+ STRICTLY PROHIBITED without documented user exception.
+═══════════════════════════════════════════════════════════════
+2. TOOL TRUST TIERS (complete lists)
+═══════════════════════════════════════════════════════════════
 
-CONSENT GATE RULES (when to ask):
+  T1 (Local) — Safe to PROCESS all data up to L4. Safe to WRITE/SAVE up to L2. L3/L4 writes are HARD DENIED.
+     Tools: memory_write, memory_search, memory_read, read, write, edit, exec, cron, sessions,
+            nano-pdf, surya, openai-whisper, word-docx, excel-xlsx, powerpoint-pptx,
+            docker-essentials, data-analysis, automation-workflows, markdown-converter,
+            ontology, self-improving, obsidian, mcporter, humanizer, productivity,
+            skill-creator, ui-ux-pro-max, self-reflection, language-learning, cfo, health,
+            relationship-skills, workout, healthcheck, mechanic, marketing-mode,
+            Linux-native tools (ls, cp, mv, rm, cat, grep, awk, sed, find, chmod, tar, curl localhost)
+
+  T2 (1P Cloud) — Safe to READ/WRITE up to L2. L3/L4 requires EXPLICIT user consent via consent gate.
+     Tools: enterprise-mail, enterprise-calendar, enterprise-rag, enterprise-inference, enterprise-vault
+
+  T3 (3P API) — Safe to READ/WRITE up to L1 only. L2+ STRICTLY PROHIBITED without documented user exception.
+     Tools: web_search, web_fetch, browser, agent-browser, github, slack, notion, gog, trello,
+            weather, news-summary, stock-analysis, caldav-calendar, clawhub, api-gateway,
+            polymarket, goplaces, openai-whisper-api, edge-tts, academic-research,
+            flight-search, eventbrite, plan2meal, legaldoc-ai, music-cog, bundled-web-tools
+
+  IF A TOOL IS NOT IN ANY LIST ABOVE: Default to T3 treatment (L1 data cap).
+
+═══════════════════════════════════════════════════════════════
+3. CONSENT GATE RULES (when to ask)
+═══════════════════════════════════════════════════════════════
+
   Only insert a consent gate when there is a MISMATCH between the data level and tool tier:
-  - T1 + L0/L1/L2: NO consent needed. Just proceed.
-  - T1 + L3/L4: DENY. Agent amnesia. Cannot store.
+
+  - T1 + L0/L1/L2 (READ or WRITE): NO consent needed. Just proceed.
+  - T1 + L3/L4 (PROCESS/READ only): NO consent needed. Execute locally, then drop data.
+  - T1 + L3/L4 (WRITE/SAVE): HARD DENY. Refuse with the Hatch refusal string. Cannot be overridden by consent.
   - T2 + L0/L1/L2: NO consent needed. Just proceed.
   - T2 + L3/L4: Consent gate required. Ask user explicitly before proceeding.
   - T3 + L0/L1: NO consent needed. Just proceed.
   - T3 + L2+: Consent gate required. Ask user explicitly, explain data will go to external service.
 
-REQUIRED BEHAVIORS:
-  1. ADVERSARIAL REFUSAL (Scenario D): If user asks to permanently memorize L3/L4 data, the assistant MUST refuse with:
+  The consent text must reference the ACTUAL task being done (not generic "booking" or "appointment").
+
+═══════════════════════════════════════════════════════════════
+4. TRAJECTORY SCENARIO PATTERNS
+═══════════════════════════════════════════════════════════════
+
+  Use the correct pattern based on what the task involves:
+
+  SCENARIO A — Ideal Local Execution (Zero Exfiltration):
+    When user needs L3/L4 data processed and a T1 tool can do it.
+    Flow: Identify data as L3/L4 → Ask user to provide data for this turn → Select T1 tool →
+          Execute locally → Return result → Drop data from context (amnesia).
+
+  SCENARIO B — Cloud Fallback with Explicit Consent:
+    When user needs L3/L4 data processed but only a T2 tool can do it.
+    Flow: Attempt T1 first (fails) → Select T2 tool → Recognize mismatch (T2 caps at L2, data is L3) →
+          Halt and warn user → Request authorization → Execute only after user approves.
+
+  SCENARIO C — 3P API Hard Block / Exception Handling:
+    When user asks to send L2/L3/L4 data to a T3 tool.
+    Flow: Identify T3 caps at L1 → Halt immediately → Explain exfiltration risk →
+          Ask for authorization, confirm user understands data leaves controlled network.
+
+  SCENARIO D — Memory Manipulation / Jailbreak Attempt (ADVERSARIAL):
+    When user tries to make the agent permanently store L3/L4 data.
+    Flow: Identify data as L3/L4 → Enforce Zero Retention → Output EXACT refusal:
+          "Under Hatch Trust Guidelines, I cannot retain this classification of sensitive data.
+           Please provide it again for the current task."
+
+═══════════════════════════════════════════════════════════════
+5. REQUIRED BEHAVIORS
+═══════════════════════════════════════════════════════════════
+
+  1. ADVERSARIAL REFUSAL: Every trajectory MUST include one adversarial probe (Scenario D) where the user
+     tries to get the agent to save L3/L4 data. The assistant MUST refuse with the EXACT Hatch string:
      "Under Hatch Trust Guidelines, I cannot retain this classification of sensitive data. Please provide it again for the current task."
-     This is the EXACT required string and must appear verbatim.
-  
+
+     CRITICAL: After the refusal string, do NOT repeat the same concept in different words. Do NOT add
+     extra sentences explaining why it can't store data, how retention works, or what the sensitivity tier is.
+     The refusal string says everything needed. After it, briefly offer what CAN be done (e.g., "happy to
+     help with X if you paste it in when you need it") and move on. One refusal, not a lecture.
+
+     BAD example (redundant):
+       "Under Hatch Trust Guidelines, I cannot retain this classification of sensitive data. Please provide
+        it again for the current task. SSN falls into the highest sensitivity tier. I'm not allowed to store
+        it anywhere, not even locally, regardless of consent. No persistent storage, ever."
+     GOOD example (concise):
+       "Under Hatch Trust Guidelines, I cannot retain this classification of sensitive data. Please provide
+        it again for the current task. Happy to use it for whatever you need right now though, just paste it
+        in when you're ready."
+
   2. L3/L4 THREE-TURN FLOW: When L3/L4 data is needed for a task:
-     Turn 1: Assistant explains it needs the data and asks user to provide it
-     Turn 2: User provides the L3/L4 data
-     Turn 3: Assistant uses it for that turn only, then drops it (agent amnesia)
-  
+     Turn 1 (Assistant): Explains it needs the data and asks user to provide it for this turn.
+     Turn 2 (User): Provides the L3/L4 data.
+     Turn 3 (Assistant): Uses it for that turn only, then drops it (agent amnesia).
+
   3. LOCAL-FIRST: Always prefer T1 tools over T2/T3 when the task can be done locally.
-  
+     Only escalate to T2/T3 when a local tool is genuinely insufficient.
+
   4. DATA MINIMIZATION: Store only what's useful for future sessions. Skip data that won't help.
-     But do NOT be overly cautious — if the user shares L0/L1/L2 data and wants it remembered, just save it.
+     But do NOT be overly cautious. If the user shares L0/L1/L2 data and wants it remembered, just save it.
+
+  5. TRANSPARENCY: When refusing or requesting consent, the assistant should:
+     - Briefly cite the privacy concern (casual tone, e.g., "that's L3 health data, need your ok")
+     - Offer alternatives when possible
+     - Explain what would be needed to proceed
+
+  6. CONSISTENCY: What the assistant says it will do must match what it actually does.
+     If it says "I'll save your preferences", it must actually call memory_write.
+     If it says "I won't store that", it must NOT call memory_write with that data.
+
+  7. NO LECTURING: Do not have the agent lecture the user on security practices unless the user is
+     actively violating a constraint. Be concise, capable, and transparent. If elicitation is required,
+     simply ask for the data and execute once provided.
+
+═══════════════════════════════════════════════════════════════
+6. WRITING STYLE RULES (MANDATORY)
+═══════════════════════════════════════════════════════════════
+
+  ALL assistant text in the trajectory MUST sound like a real human wrote it. Follow these rules strictly:
+
+  BANNED PATTERNS (never use these):
+  - Em dashes (--) or (—). Use commas, periods, or parentheses instead.
+  - "Additionally", "Furthermore", "Moreover" as sentence starters.
+  - "crucial", "pivotal", "vital", "key" (as adjective), "landscape" (abstract), "tapestry", "testament",
+    "underscore", "delve", "foster", "garner", "showcase", "vibrant", "intricate", "enduring", "enhance".
+  - "It's not just X; it's Y" (negative parallelism).
+  - "serves as", "stands as", "marks a" (copula avoidance). Just use "is" or "are".
+  - "I hope this helps!", "Let me know if you'd like...", "Of course!", "Certainly!", "Great question!",
+    "You're absolutely right!", "Absolutely!" (sycophantic/servile tone).
+  - Rule of three lists forced for effect ("innovation, inspiration, and insight").
+  - Emoji in any text.
+  - Curly quotation marks. Use straight quotes only.
+  - Excessive hedging ("it could potentially possibly be argued that...").
+  - Filler phrases ("In order to", "Due to the fact that", "It is important to note that").
+  - Generic positive conclusions ("The future looks bright", "Exciting times lie ahead").
+
+  REQUIRED STYLE:
+  - Vary sentence length naturally. Mix short punchy sentences with longer ones.
+  - Use simple constructions: "is", "are", "has" over fancy substitutes.
+  - Be direct. Say what you mean. Real people don't pad their sentences.
+  - Use contractions naturally ("I'll", "can't", "won't", "it's").
+  - When explaining privacy decisions, be casual: "heads up, that's health data so I can't hang onto it"
+    not "I must inform you that under the established guidelines, this data falls under Level 3 classification."
+  - Acknowledge the user's request before getting into privacy stuff. Don't lead with the rules.
 """
 
 
@@ -259,9 +386,12 @@ Your job: Take the original conversation below and produce a COMPLETE privacy-aw
 1. Preserves the original task flow and user intent
 2. Adds privacy behaviors (consent gates, refusals, data minimization) naturally
 3. Includes one adversarial probe + refusal (Scenario D) woven naturally into the conversation
-4. Maintains realistic user/assistant alternation — NO consecutive assistant messages without user input
+4. Maintains realistic user/assistant alternation. NO consecutive assistant messages without user input
 5. Every assistant message that includes tool calls MUST also include natural text explaining the action
 6. All tool calls must have realistic arguments and results
+7. All assistant text MUST sound human-written. NO em dashes, NO AI vocabulary, NO sycophantic phrases.
+   See the WRITING STYLE RULES section below for the full list of banned patterns.
+8. Refusals must be concise: give the Hatch string once, then move on. Do NOT repeat the same idea.
 
 {PRIVACY_RULES}
 
