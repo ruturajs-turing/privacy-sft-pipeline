@@ -49,8 +49,8 @@ The pipeline uses 80+ PII labels mapped to sensitivity levels via `data/classifi
 |-------|---------------|-------------|
 | **L4 Critical** | `AUTH_PASSWORD`, `GOV_SSN_FULL`, `FIN_PAN_FULL`, `HEALTH_GENETIC`, `BIO_FINGERPRINT` | Zero retention, never persisted |
 | **L3 Highly Sensitive** | `HEALTH_DIAGNOSIS`, `FIN_SALARY`, `LOC_HOME_ADDRESS`, `COMMS_EMAIL_BODY` | Hard deny on persistence, allow ephemeral |
-| **L2 Sensitive** | `ID_FULL_NAME`, `ID_EMAIL`, `ID_PHONE`, `AUTH_USERNAME`, `FIN_TRANSACTION` | Consent flow for persistence |
-| **L1 Caution** | `DEV_IP_ADDR`, `DEV_MAC_ADDR`, `DEV_COOKIE`, `DEV_USER_AGENT` | Allowed with minimization |
+| **L2 Sensitive** | `ID_FULL_NAME`, `ID_EMAIL`, `ID_PHONE`, `AUTH_USERNAME`, `FIN_TRANSACTION` | No consent required; freely usable |
+| **L1 Caution** | `DEV_IP_ADDR`, `DEV_MAC_ADDR`, `DEV_COOKIE`, `DEV_USER_AGENT` | No consent required; freely usable |
 | **L0 Public** | `LOC_COUNTRY`, `ORG_PUBLIC`, `FIN_ROUTING_ALONE` | Freely usable |
 
 ## HTG Framework & FREE_BAND Authorization Matrix
@@ -63,12 +63,12 @@ The authorization matrix determines what's allowed without consent:
 |------|------|-------|
 | T1 (local) | Free up to L4 | Free up to L2 |
 | T2 (1P cloud) | Free up to L2 | Free up to L2 |
-| T3 (external) | Free up to L1 | Free up to L1 |
+| T3 (external) | Free up to L2 | Free up to L2 |
 
 **Special rules:**
 - T1 write + L3/L4 → **HARD DENY** (any local file, not just memory)
 - T2 + L3/L4 → **CONSENT GATE** (Gate 4b)
-- T3 + L2+ → **CONSENT GATE** (Gate 4c)
+- T3 + L3+ → **CONSENT GATE** (Gate 4c)
 
 ### Tool Trust Tiers (156 tools)
 
@@ -76,8 +76,8 @@ The authorization matrix determines what's allowed without consent:
 |------|----------------|---------------|
 | T1 Local | L4 (ephemeral only) | `exec`, `read`, `write`, `memory_search`, `vault_get` |
 | T1 Persistence | **L2 max** (L3/L4 HARD DENY) | `memory_write`, `active_memory_write`, `wiki_apply` |
-| T2 1P Cloud | L2 (L3 with consent) | `enterprise-mail`, `enterprise-rag`, `enterprise-database` |
-| T3 3P API | L1 only (L2+ with consent) | `web_search`, `slack`, `notion`, `github`, `gmail` |
+| T2 1P Cloud | L2 free (L3+ with consent) | `enterprise-mail`, `enterprise-rag`, `enterprise-database` |
+| T3 3P API | L2 free (L3+ with consent) | `web_search`, `slack`, `notion`, `github`, `gmail` |
 
 ### 5-Step Authorization Procedure
 
@@ -113,7 +113,7 @@ Param remapping is applied automatically via `param_map` when substituting (e.g.
 
 ## Multi-Turn Consent Flow
 
-When L2 data is written to persistence paths, the pipeline generates a realistic 3-step interaction:
+When L3+ data requires a consent gate (e.g., T2/T3 write with L3 data), the pipeline generates a realistic 3-step interaction:
 
 1. **Assistant asks** — Natural consent request (not robotic)
 2. **User responds** — Persona-driven response based on personality traits
