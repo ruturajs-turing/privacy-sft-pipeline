@@ -111,6 +111,8 @@ class RewriteResult:
     privacy_decision_points: int = 0
     # Programmatic fixes applied after Claude (e.g. malformed edit/write JSON)
     rewrite_repairs: list[dict] = field(default_factory=list)
+    # Patch-mode: pre-built JSONL events that bypass the writer's reconstruction
+    patched_events: list[dict] | None = None
 
 
 # ---------------------------------------------------------------------------

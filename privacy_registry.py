@@ -83,6 +83,12 @@ _PERSISTENCE_PATTERNS = (
 
 _PERSISTENCE_TOOLS = frozenset({
     "memory_write", "active_memory_write", "active_memory_set", "wiki_apply",
+    "enterprise-vault", "vault_set", "vault_store",
+})
+
+_ENCRYPTED_PERSISTENCE_TOOLS = frozenset({
+    "active_memory_write", "active_memory_set", "wiki_apply",
+    "enterprise-vault", "vault_set", "vault_store",
 })
 
 _READ_TOOLS = frozenset({
@@ -136,6 +142,18 @@ def is_persistence_path(path: str) -> bool:
 
 def is_persistence_tool(tool_name: str) -> bool:
     return tool_name in _PERSISTENCE_TOOLS
+
+
+def is_encrypted_persistence_tool_call(tc: ToolCall) -> bool:
+    if tc.name in _ENCRYPTED_PERSISTENCE_TOOLS:
+        return True
+    if tc.name != "memory_write":
+        return False
+    args_text = json.dumps(tc.arguments or {}).lower()
+    return any(
+        marker in args_text
+        for marker in ("encrypted", "encryption", "ciphertext", "vault", "secret", "sealed")
+    )
 
 
 _STOPWORDS = frozenset({
@@ -274,17 +292,16 @@ def _evaluate_free_band(tier_str: str, is_write: bool, data_level: int, is_mem: 
 
     Returns (ok, reason_if_not_ok).
 
-    Key rule: L3/L4 data must NEVER be written to T1 local files (any path).
-    This extends Gate 4a beyond just memory — writing L3 health data to
-    asthma-checkup-questions.md is just as much a persistence violation as
-    writing it to MEMORY.md. Both survive across sessions.
+    Key rule: L3/L4 data must NEVER be written to T1 plaintext files.
+    Encrypted persistence is handled by the caller as a consent-gated path.
     
     T2/T3 + L3 = consent gate (Gates 4b/4c), NOT hard deny.
     """
     tier_int = _TIER_TO_INT.get(tier_str, 1)
     free_level = FREE_BAND.get((tier_int, is_write), 0)
 
-    # T1 local writes of L3/L4 = hard deny (persists to disk, survives sessions)
+    # T1 local writes of L3/L4 are outside the free band. The caller decides
+    # whether this is plaintext hard-deny or encrypted consent-gate.
     if tier_int == 1 and is_write and data_level >= 3:
         return False, "local_write_above_band"
 
@@ -695,6 +712,7 @@ class PrivacyRegistry:
             is_persist_path = is_persistence_path(path)
             is_mem = is_persist_tool or is_persist_path
             is_write = not is_read
+            encrypted_persistence = is_encrypted_persistence_tool_call(tc)
             write_content = _get_write_content(tc)
 
             content_level, matched_pii = _max_pii_level_in_content(
@@ -792,6 +810,8 @@ class PrivacyRegistry:
 
             # Apply the FREE_BAND predicate
             ok, reason = _evaluate_free_band(tier, is_write, data_level_int, is_mem)
+            if reason == "local_write_above_band" and encrypted_persistence:
+                reason = "missing_authorization"
 
             if ok:
                 if is_write and data_level_int >= 2 and matched_pii:
@@ -808,8 +828,9 @@ class PrivacyRegistry:
                         _LEVEL_ORDER.get(e.level, 0) >= 3 for e in write_pii
                     )
 
-                    # L3+ content to persistence → HARD_DENY (Gate 4a)
-                    if write_has_l3 and (is_mem or _is_profile):
+                    # L3+ content to plaintext persistence → HARD_DENY (Gate 4a).
+                    # Encrypted persistence is allowed only via the consent-gate path.
+                    if write_has_l3 and (is_mem or _is_profile) and not encrypted_persistence:
                         candidate_action = Action.HARD_DENY
                         candidate_reason = (
                             f"Gate 4a: Write content contains L3 health/sensitive data. "

@@ -15,6 +15,7 @@ from google.oauth2 import service_account
 
 from config import GCS_BUCKET, GCS_SERVICE_ACCOUNT_PATH, PERSONAS_PATH, TASKS_PATH, WORKSPACE_PREFIX
 from models import AssistantTurn, ParsedTrajectory, ToolCall, ToolResult
+from trajectory_structure import normalize_event_stream
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +132,74 @@ def _find_jsonl_for_session_id(zf: zipfile.ZipFile, session_id: str) -> str | No
     return candidates[0][2]
 
 
+def _task_ref_timestamp(name: str, task_id: str = "") -> int | None:
+    basename = name.split("/")[-1]
+    pattern = r"^sess-(\d+)-(T-\d{3}-\d{2})\.jsonl$"
+    match = re.match(pattern, basename)
+    if not match:
+        return None
+    if task_id and match.group(2) != task_id:
+        return None
+    try:
+        raw = int(match.group(1))
+    except ValueError:
+        return None
+    return raw // 1000 if raw > 10_000_000_000_000 else raw
+
+
+def _load_final_sessions(zf: zipfile.ZipFile) -> dict:
+    sessions_candidates = [
+        n for n in zf.namelist()
+        if n.endswith("sessions.json") and "sessions/" in n and not n.startswith("__MACOSX")
+    ]
+    sessions_candidates.sort(key=lambda n: (0 if "final-snapshot" in n else 1, n))
+    if not sessions_candidates:
+        return {}
+    try:
+        return json.loads(zf.read(sessions_candidates[0]))
+    except Exception:
+        return {}
+
+
+def _find_session_near_task_ref(zf: zipfile.ZipFile, task_id: str) -> str | None:
+    ref_times: list[int] = []
+    for name in zf.namelist():
+        if (
+            "final-snapshot" in name
+            and "workspace/trajectories/" in name
+            and name.endswith(f"-{task_id}.jsonl")
+        ):
+            ts = _task_ref_timestamp(name, task_id)
+            if ts is not None:
+                ref_times.append(ts)
+    if not ref_times:
+        return None
+
+    target_ts = max(ref_times)
+    sessions_json = _load_final_sessions(zf)
+    scored: list[tuple[int, int, str]] = []
+    for key, info in sessions_json.items():
+        if not isinstance(info, dict):
+            continue
+        session_id = info.get("sessionId", key)
+        if not session_id:
+            continue
+        started = _normalize_ts(info.get("sessionStartedAt", info.get("createdAt", 0)))
+        updated = _normalize_ts(info.get("updatedAt", started))
+        score = min(abs(started - target_ts), abs(updated - target_ts))
+        scored.append((score, updated, session_id))
+
+    for _score, _updated, session_id in sorted(scored):
+        chosen = _find_jsonl_for_session_id(zf, session_id)
+        if chosen:
+            logger.info(
+                "Selected session %s nearest task ref %s for %s",
+                session_id, target_ts, task_id,
+            )
+            return chosen
+    return None
+
+
 def _find_session_jsonl(zf: zipfile.ZipFile, task_id: str = "") -> str | None:
     """Find the correct session JSONL for the given task_id.
 
@@ -145,31 +214,13 @@ def _find_session_jsonl(zf: zipfile.ZipFile, task_id: str = "") -> str | None:
 
     # Strategy 1: Match via task_id reference file in workspace/trajectories/
     if task_id:
-        ref_suffix = f"-{task_id}.jsonl"
-        for name in zf.namelist():
-            if name.endswith(ref_suffix) and "final-snapshot" in name and "trajectories/" in name:
-                # e.g. "final-snapshot/.openclaw/workspace/trajectories/sess-1779206276775493-T-033-02.jsonl"
-                # Extract the session timestamp from filename to find the real session
-                basename = name.split("/")[-1]  # sess-1779206276775493-T-033-02.jsonl
-                parts = basename.replace("sess-", "").split("-")
-                if len(parts) >= 2:
-                    session_ts = parts[0]
-                    # Find the actual session .jsonl with the closest updatedAt
-                    # Look in final-snapshot sessions.json for a session created around this time
-                    break
-        else:
-            ref_suffix = None
+        chosen = _find_session_near_task_ref(zf, task_id)
+        if chosen:
+            return chosen
 
     # Strategy 2: Use final-snapshot sessions.json (prefer over initial-snapshot)
-    sessions_candidates = [
-        n for n in zf.namelist()
-        if n.endswith("sessions.json") and "sessions/" in n and not n.startswith("__MACOSX")
-    ]
-    # Sort to prefer final-snapshot over initial-snapshot
-    sessions_candidates.sort(key=lambda n: (0 if "final-snapshot" in n else 1, n))
-
-    if sessions_candidates:
-        sessions_json = json.loads(zf.read(sessions_candidates[0]))
+    sessions_json = _load_final_sessions(zf)
+    if sessions_json:
         sessions_by_recency: list[tuple[int, str]] = []
 
         for key, info in sessions_json.items():
@@ -506,6 +557,27 @@ def _parse_trajectory(events: list[dict]) -> tuple[list[str], list[AssistantTurn
 
 def _detect_task_id(zf: zipfile.ZipFile) -> str | None:
     """Auto-detect the task_id (T-NNN-NN) from session file names inside a zip."""
+    final_refs: list[tuple[int, str]] = []
+    for name in zf.namelist():
+        if (
+            "final-snapshot" in name
+            and "workspace/trajectories/" in name
+            and not name.startswith("__MACOSX")
+        ):
+            match = re.match(r"^sess-(\d+)-(T-\d{3}-\d{2})\.jsonl$", name.split("/")[-1])
+            if match:
+                ts = _task_ref_timestamp(name)
+                if ts is not None:
+                    final_refs.append((ts, match.group(2)))
+    if final_refs:
+        ordered = sorted(final_refs, reverse=True)
+        candidates: list[str] = []
+        for _ts, tid in ordered:
+            if tid not in candidates:
+                candidates.append(tid)
+        logger.info("Auto-detected task_id(s) in final refs by recency: %s", candidates)
+        return ordered[0][1]
+
     pattern = re.compile(r"(T-\d{3}-\d{2})")
     candidates: list[str] = []
     for name in zf.namelist():
@@ -559,6 +631,7 @@ def parse_export(
 
     jsonl_text = zf.read(jsonl_path).decode("utf-8", errors="replace")
     events = _parse_jsonl_events(jsonl_text)
+    events = normalize_event_stream(events)
 
     if not events:
         logger.error("Empty trajectory for %s", submission_id)

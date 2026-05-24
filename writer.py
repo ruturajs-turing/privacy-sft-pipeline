@@ -22,6 +22,7 @@ from models import (
     RejectedStep,
     RLHFBatchReport,
 )
+from trajectory_structure import normalize_event_stream, validate_event_stream
 
 logger = logging.getLogger(__name__)
 _SAMPLE_WORKSPACE_MAX_FILES = 25
@@ -117,11 +118,14 @@ def _turn_to_jsonl_events(
     if turn.text and has_tool_calls and not turn.text.startswith(("done", "saved", "wrote")):
         content.append({"type": "text", "text": turn.text})
 
+    tc_ids: list[str] = []
     for tc in turn.tool_calls:
         if isinstance(tc, dict):
+            tc_id = tc.get("id") or _tool_call_hex_id()
+            tc_ids.append(tc_id)
             content.append({
                 "type": "toolCall",
-                "id": tc.get("id", f"chatcmpl-tool-{uuid.uuid4().hex[:16]}"),
+                "id": tc_id,
                 "name": tc.get("name", ""),
                 "arguments": tc.get("arguments", {}),
             })
@@ -152,8 +156,9 @@ def _turn_to_jsonl_events(
         "message": msg_data,
     })
 
-    for tr in turn.tool_results:
+    for i, tr in enumerate(turn.tool_results):
         if isinstance(tr, dict):
+            linked_tc_id = tr.get("call_id") or (tc_ids[i] if i < len(tc_ids) else _tool_call_hex_id())
             events.append({
                 "type": "message",
                 "id": _generate_event_id(),
@@ -161,7 +166,7 @@ def _turn_to_jsonl_events(
                 "timestamp": f"{_ts_to_iso(ts + 1000)}",
                 "message": {
                     "role": "toolResult",
-                    "toolCallId": tr.get("call_id", ""),
+                    "toolCallId": linked_tc_id,
                     "toolName": tr.get("tool_name", ""),
                     "content": [{"type": "text", "text": tr.get("content", "")}],
                     "isError": tr.get("is_error", False),
@@ -178,6 +183,18 @@ def _ts_to_iso(ts_ms: int) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{ts_ms % 1000:03d}Z"
 
 
+def _iso_to_ms(value: object) -> int | None:
+    if isinstance(value, (int, float)):
+        return int(value)
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        dt = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return int(dt.timestamp() * 1000)
+
+
 # ---------------------------------------------------------------------------
 # De-fingerprinting: make synthetic output indistinguishable from real
 # ---------------------------------------------------------------------------
@@ -191,7 +208,10 @@ def _response_id() -> str:
     return 'A' + ''.join(random.choices(chars, k=22))
 
 
-def _build_session_header(session_id: str, base_ms: int) -> list[dict]:
+def _build_session_header(session_id: str, base_ms: int,
+                          cwd: str = "/home/user/OpenClawTrainer/workspace",
+                          provider: str = "llama",
+                          model_id: str = "plum-robin") -> list[dict]:
     mc_id = _generate_event_id()
     tl_id = _generate_event_id()
     ms_id = _generate_event_id()
@@ -201,15 +221,15 @@ def _build_session_header(session_id: str, base_ms: int) -> list[dict]:
             "version": 3,
             "id": session_id,
             "timestamp": _ts_to_iso(base_ms),
-            "cwd": "/home/user/OpenClawTrainer/workspace",
+            "cwd": cwd,
         },
         {
             "type": "model_change",
             "id": mc_id,
             "parentId": None,
             "timestamp": _ts_to_iso(base_ms + random.randint(2, 5)),
-            "provider": "llama",
-            "modelId": "plum-robin",
+            "provider": provider,
+            "modelId": model_id,
         },
         {
             "type": "thinking_level_change",
@@ -234,10 +254,17 @@ def _build_session_header(session_id: str, base_ms: int) -> list[dict]:
     ]
 
 
-def _assign_realistic_timestamps(events: list[dict]) -> None:
+def _assign_realistic_timestamps(events: list[dict], base_ms: int | None = None) -> None:
     if not events:
         return
-    base_ms = int(time.time() * 1000) - random.randint(600_000, 7_200_000)
+    if base_ms is None:
+        for evt in events:
+            base_ms = _iso_to_ms(evt.get("timestamp"))
+            if base_ms is not None:
+                break
+    if base_ms is None:
+        base_ms = int(time.time() * 1000) - random.randint(600_000, 7_200_000)
+
     cursor = base_ms
     first_user_seen = False
 
@@ -247,21 +274,25 @@ def _assign_realistic_timestamps(events: list[dict]) -> None:
         role = msg.get("role", "")
 
         if evt_type == "session":
-            cursor = base_ms
+            cursor = max(cursor, base_ms)
         elif evt_type in ("model_change", "thinking_level_change", "custom"):
             cursor += random.randint(2, 8)
         elif role == "user":
             if not first_user_seen:
-                cursor += random.randint(10, 50)
+                cursor += random.randint(800, 2_500)
                 first_user_seen = True
             else:
-                cursor += random.randint(30_000, 300_000)
+                cursor += random.randint(20_000, 180_000)
         elif role == "assistant":
-            cursor += random.randint(2_000, 15_000)
+            has_tool_call = any(
+                isinstance(item, dict) and item.get("type") == "toolCall"
+                for item in msg.get("content", [])
+            ) if isinstance(msg.get("content"), list) else False
+            cursor += random.randint(1_500, 6_000) if has_tool_call else random.randint(4_000, 18_000)
         elif role == "toolResult":
-            cursor += random.randint(20, 500)
+            cursor += random.randint(350, 2_500)
         else:
-            cursor += random.randint(100, 1000)
+            cursor += random.randint(250, 1_200)
 
         evt["timestamp"] = _ts_to_iso(cursor)
         if msg:
@@ -696,7 +727,6 @@ def _defingerprint_events(events: list[dict], session_id: str) -> list[dict]:
     result = header + message_events
 
     result = _merge_consecutive_text_messages(result)
-    result = _collapse_assistant_tool_chains(result)
     result = _ensure_assistant_text_after_user(result)
     _rebuild_parent_chain(result)
     _assign_realistic_timestamps(result)
@@ -705,7 +735,72 @@ def _defingerprint_events(events: list[dict], session_id: str) -> list[dict]:
     _add_tool_result_details(result)
     _strip_synthetic_fingerprints(result)
 
+    return normalize_event_stream(result)
+
+
+def _message_role(evt: dict) -> str:
+    msg = evt.get("message", {}) if isinstance(evt.get("message"), dict) else {}
+    role = msg.get("role")
+    return role if isinstance(role, str) else ""
+
+
+def _ensure_terminal_assistant_message(events: list[dict]) -> list[dict]:
+    """Make SFT outputs end on an assistant message."""
+    result = list(events)
+    last_message = None
+    for evt in reversed(result):
+        if evt.get("type") == "message" and isinstance(evt.get("message"), dict):
+            last_message = evt
+            break
+    if not last_message or _message_role(last_message) == "assistant":
+        return result
+
+    role = _message_role(last_message)
+    text = (
+        "Got it. I won't take any further action unless you ask."
+        if role == "user"
+        else "I wasn't able to complete that automatically. The safest next step is to continue manually or contact the service directly."
+    )
+    parent_id = last_message.get("id")
+    result.append({
+        "type": "message",
+        "id": _generate_event_id(),
+        "parentId": parent_id if isinstance(parent_id, str) else None,
+        "timestamp": _ts_to_iso(_current_ts()),
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": text}],
+        },
+    })
     return result
+
+
+def _infer_privacy_markers(events: list[dict]) -> tuple[list[str], int]:
+    scenarios: set[str] = set()
+    points = 0
+    for evt in events:
+        if evt.get("type") != "message" or not isinstance(evt.get("message"), dict):
+            continue
+        msg = evt["message"]
+        text = " ".join(
+            str(item.get("text", ""))
+            for item in msg.get("content", [])
+            if isinstance(item, dict) and item.get("type") == "text"
+        )
+        lowered = text.lower()
+        if "hatch trust guidelines" in lowered:
+            scenarios.add("D")
+            points += 1
+        if (
+            "external clinic" in lowered
+            or "clinic site" in lowered
+            or "mednow" in lowered and "share" in lowered
+            or "don't save" in lowered
+            or "plaintext notes" in lowered
+        ):
+            scenarios.add("C")
+            points += 1
+    return sorted(scenarios), points
 
 
 def write_trajectory_output(
@@ -721,86 +816,126 @@ def write_trajectory_output(
     task_dir.mkdir(parents=True, exist_ok=True)
 
     session_id = trajectory.session_uuid or str(uuid.uuid4())
-    base_ts = _current_ts()
 
-    # 1. trajectory.jsonl — rewritten privacy-compliant session
-    jsonl_events = []
+    orig_base_ts = None
+    orig_cwd = "/home/user/OpenClawTrainer/workspace"
+    orig_provider = "llama"
+    orig_model = "plum-robin"
+    for evt in (trajectory.ordered_events or []):
+        if isinstance(evt, dict):
+            if evt.get("type") == "session" and not orig_base_ts:
+                ts_str = evt.get("timestamp", "")
+                if ts_str:
+                    try:
+                        from datetime import datetime, timezone
+                        dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                        orig_base_ts = int(dt.timestamp() * 1000)
+                    except (ValueError, TypeError):
+                        pass
+                if evt.get("cwd"):
+                    orig_cwd = evt["cwd"]
+            if evt.get("type") == "model_change":
+                orig_provider = evt.get("provider", orig_provider)
+                orig_model = evt.get("modelId", orig_model)
 
-    # Session event
-    jsonl_events.append({
-        "type": "session",
-        "id": session_id,
-        "createdAt": _ts_to_iso(base_ts),
-    })
+    base_ts = orig_base_ts or _current_ts()
 
-    # Use thread_order to reconstruct proper interleaving.
-    # Build a map: for each assistant turn_index, determine which user message (if any) precedes it.
-    user_before_turn: dict[int, int] = _build_user_before_turn_map(trajectory)
+    # 1. trajectory.jsonl -- rewritten privacy-compliant session
+    if rewrite_result.patched_events is not None:
+        # Patch-mode: events are pre-built from original raw events
+        jsonl_events = list(rewrite_result.patched_events)
+    else:
+        jsonl_events = []
 
-    # Emit events in thread order with proper parentId chaining
-    emitted_user_msgs: set[int] = set()
-    last_event_id = session_id
+        jsonl_events.append({
+            "type": "session",
+            "id": session_id,
+            "createdAt": _ts_to_iso(base_ts),
+        })
 
-    for rt_idx, rt in enumerate(rewrite_result.turns):
-        if rt.turn_index in user_before_turn and rt.turn_index not in emitted_user_msgs:
-            if not rt.synthetic_user_message:
-                u_idx = user_before_turn[rt.turn_index]
-                if u_idx < len(trajectory.user_messages):
-                    evt_id = _generate_event_id()
-                    ts = base_ts + (rt.turn_index * 5000) - 1000
-                    jsonl_events.append({
-                        "type": "message",
-                        "id": evt_id,
-                        "parentId": last_event_id,
-                        "timestamp": _ts_to_iso(ts),
-                        "message": {
-                            "role": "user",
-                            "content": [{"type": "text", "text": trajectory.user_messages[u_idx]}],
-                        }
-                    })
-                    last_event_id = evt_id
-            emitted_user_msgs.add(rt.turn_index)
+        # Use thread_order to reconstruct proper interleaving.
+        user_before_turn: dict[int, int] = _build_user_before_turn_map(trajectory)
 
-        if rt.is_adversarial and rt.adversarial_user_message:
-            evt_id = _generate_event_id()
-            ts = base_ts + (rt.turn_index * 5000) + 2000
-            jsonl_events.append({
-                "type": "message",
-                "id": evt_id,
-                "parentId": last_event_id,
-                "timestamp": _ts_to_iso(ts),
-                "message": {
-                    "role": "user",
-                    "content": [{"type": "text", "text": rt.adversarial_user_message}],
-                }
-            })
-            last_event_id = evt_id
+        emitted_user_msgs: set[int] = set()
+        last_event_id = session_id
 
-        if rt.synthetic_user_message:
-            evt_id = _generate_event_id()
-            ts = base_ts + (rt.turn_index * 5000) + 2500
-            jsonl_events.append({
-                "type": "message",
-                "id": evt_id,
-                "parentId": last_event_id,
-                "timestamp": _ts_to_iso(ts),
-                "message": {
-                    "role": "user",
-                    "content": [{"type": "text", "text": rt.synthetic_user_message}],
-                }
-            })
-            last_event_id = evt_id
+        for rt_idx, rt in enumerate(rewrite_result.turns):
+            if rt.turn_index in user_before_turn and rt.turn_index not in emitted_user_msgs:
+                if not rt.synthetic_user_message:
+                    u_idx = user_before_turn[rt.turn_index]
+                    if u_idx < len(trajectory.user_messages):
+                        evt_id = _generate_event_id()
+                        ts = base_ts + (rt.turn_index * 5000) - 1000
+                        jsonl_events.append({
+                            "type": "message",
+                            "id": evt_id,
+                            "parentId": last_event_id,
+                            "timestamp": _ts_to_iso(ts),
+                            "message": {
+                                "role": "user",
+                                "content": [{"type": "text", "text": trajectory.user_messages[u_idx]}],
+                            }
+                        })
+                        last_event_id = evt_id
+                emitted_user_msgs.add(rt.turn_index)
 
-        # Assistant turn events
-        turn_events = _turn_to_jsonl_events(rt, session_id, base_ts)
-        for evt in turn_events:
-            if "parentId" not in evt or evt.get("parentId") == evt.get("id"):
-                evt["parentId"] = last_event_id
-            jsonl_events.append(evt)
-            last_event_id = evt["id"]
+            if rt.is_adversarial and rt.adversarial_user_message:
+                evt_id = _generate_event_id()
+                ts = base_ts + (rt.turn_index * 5000) + 2000
+                jsonl_events.append({
+                    "type": "message",
+                    "id": evt_id,
+                    "parentId": last_event_id,
+                    "timestamp": _ts_to_iso(ts),
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": rt.adversarial_user_message}],
+                    }
+                })
+                last_event_id = evt_id
 
-    # De-fingerprint: realistic IDs, timestamps, metadata, session lifecycle
-    jsonl_events = _defingerprint_events(jsonl_events, session_id)
+            if rt.synthetic_user_message:
+                evt_id = _generate_event_id()
+                ts = base_ts + (rt.turn_index * 5000) + 2500
+                jsonl_events.append({
+                    "type": "message",
+                    "id": evt_id,
+                    "parentId": last_event_id,
+                    "timestamp": _ts_to_iso(ts),
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": rt.synthetic_user_message}],
+                    }
+                })
+                last_event_id = evt_id
+
+            # Assistant turn events
+            turn_events = _turn_to_jsonl_events(rt, session_id, base_ts)
+            for evt in turn_events:
+                if "parentId" not in evt or evt.get("parentId") == evt.get("id"):
+                    evt["parentId"] = last_event_id
+                jsonl_events.append(evt)
+                last_event_id = evt["id"]
+
+        # De-fingerprint: realistic IDs, timestamps, metadata, session lifecycle
+        jsonl_events = _defingerprint_events(jsonl_events, session_id)
+
+    jsonl_events = normalize_event_stream(jsonl_events)
+    jsonl_events = normalize_event_stream(_ensure_terminal_assistant_message(jsonl_events))
+    _assign_realistic_timestamps(jsonl_events, base_ts)
+    structure_issues = validate_event_stream(jsonl_events)
+    if structure_issues:
+        logger.warning(
+            "Trajectory structure validation found %d issue(s) for %s",
+            len(structure_issues),
+            trajectory.task_id,
+        )
+
+    inferred_scenarios, inferred_privacy_points = _infer_privacy_markers(jsonl_events)
+    if not rewrite_result.scenarios_covered and inferred_scenarios:
+        rewrite_result.scenarios_covered = inferred_scenarios
+    if rewrite_result.privacy_decision_points <= 0 and inferred_privacy_points:
+        rewrite_result.privacy_decision_points = inferred_privacy_points
 
     # Write JSONL
     jsonl_path = task_dir / "trajectory.jsonl"
@@ -875,6 +1010,10 @@ def write_trajectory_output(
         "skills_used": rewrite_result.skills_used,
         "privacy_decision_points": rewrite_result.privacy_decision_points,
         "rewrite_repairs": rewrite_result.rewrite_repairs,
+        "structure_validation": {
+            "issue_count": len(structure_issues),
+            "issues": structure_issues[:50],
+        },
         "verification": {
             "verdict": verification.verdict,
             "privacy_compliance": verification.privacy_compliance,
@@ -1008,6 +1147,8 @@ def write_sft_dataset(output_dir: Path, reports: list[TaskReport]) -> int:
             if report.status not in ("PASS", "MINOR_FIXED"):
                 continue
             sample_path = output_dir / report.submission_id / "trajectory_sample_format.json"
+            if not sample_path.exists() and output_dir.name == "_pipeline":
+                sample_path = output_dir.parent / report.submission_id / "trajectory_sample_format.json"
             if not sample_path.exists():
                 logger.warning("Skipping SFT entry, missing sample file: %s", sample_path)
                 continue

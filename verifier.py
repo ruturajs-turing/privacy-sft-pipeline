@@ -75,6 +75,52 @@ def _build_trajectory_for_verification(
     lines.append("not accidental PII injection by the assistant.")
     lines.append("")
 
+    if rewrite_result.patched_events is not None:
+        for turn_no, event in enumerate(
+            e for e in rewrite_result.patched_events
+            if isinstance(e, dict) and e.get("type") == "message"
+        ):
+            msg = event.get("message", {})
+            if not isinstance(msg, dict):
+                continue
+            role = msg.get("role", "unknown")
+            lines.append(f"### {role.title()} Event {turn_no + 1}:")
+            content = msg.get("content", [])
+            if isinstance(content, str):
+                lines.append(content)
+            elif isinstance(content, list):
+                text_parts = []
+                tool_calls = []
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    if block.get("type") == "text":
+                        text_parts.append(str(block.get("text", "")))
+                    elif block.get("type") == "toolCall":
+                        args_str = json.dumps(block.get("arguments", {}))
+                        if len(args_str) > 400:
+                            args_str = args_str[:400] + "..."
+                        tool_calls.append(f"  - {block.get('name', '?')}({args_str})")
+                if text_parts:
+                    lines.append("**Text:** " + "\n".join(t for t in text_parts if t.strip()))
+                if tool_calls:
+                    lines.append("**Tool Calls:**")
+                    lines.extend(tool_calls)
+            if role == "toolResult":
+                result_text = ""
+                content = msg.get("content", [])
+                if isinstance(content, list):
+                    result_text = " ".join(
+                        str(block.get("text", ""))
+                        for block in content
+                        if isinstance(block, dict) and block.get("type") == "text"
+                    )
+                if len(result_text) > 300:
+                    result_text = result_text[:300] + "..."
+                lines.append(f"**Tool Result:** {msg.get('toolName', '?')}: {result_text}")
+            lines.append("")
+        return "\n".join(lines)
+
     # Build user-before-turn mapping (same logic as writer)
     user_before_turn: dict[int, int] = {}
     if trajectory.thread_order:
