@@ -79,6 +79,26 @@ def _normalize_ts(val) -> int:
     return 0
 
 
+def _is_final_snapshot_member(name: str) -> bool:
+    """Return True for members belonging to a final snapshot.
+
+    Full exports carry a ``final-snapshot/`` prefix. When we download only the
+    slim ``final-snapshot.zip`` artifact, the same files live at ZIP root under
+    ``.openclaw/``. Treat both layouts as final snapshots.
+    """
+    if name.startswith("__MACOSX"):
+        return False
+    normalized = name.lstrip("/")
+    return "final-snapshot/" in normalized or normalized.startswith(".openclaw/")
+
+
+def _is_initial_snapshot_member(name: str) -> bool:
+    if name.startswith("__MACOSX"):
+        return False
+    normalized = name.lstrip("/")
+    return "initial-snapshot/" in normalized
+
+
 def _looks_like_valid_jsonl(zf: zipfile.ZipFile, name: str) -> bool:
     """Return True when a zip member has at least one parseable JSONL event."""
     try:
@@ -100,7 +120,23 @@ def _looks_like_valid_jsonl(zf: zipfile.ZipFile, name: str) -> bool:
     return False
 
 
-def _find_jsonl_for_session_id(zf: zipfile.ZipFile, session_id: str) -> str | None:
+def _jsonl_has_dialogue(zf: zipfile.ZipFile, name: str) -> bool:
+    """Return True when a session JSONL has at least one user and assistant turn."""
+    try:
+        text = zf.read(name).decode("utf-8", errors="replace")
+        events = normalize_event_stream(_parse_jsonl_events(text))
+        user_msgs, assistant_turns, _tool_results, _thread_order, _session_uuid = _parse_trajectory(events)
+        return bool(user_msgs and assistant_turns)
+    except Exception:
+        return False
+
+
+def _find_jsonl_for_session_id(
+    zf: zipfile.ZipFile,
+    session_id: str,
+    *,
+    require_dialogue: bool = False,
+) -> str | None:
     """Find the best standard session JSONL for a session id."""
     candidates: list[tuple[int, int, str]] = []
     for name in zf.namelist():
@@ -112,8 +148,10 @@ def _find_jsonl_for_session_id(zf: zipfile.ZipFile, session_id: str) -> str | No
             continue
         if not _looks_like_valid_jsonl(zf, name):
             continue
+        if require_dialogue and not _jsonl_has_dialogue(zf, name):
+            continue
 
-        is_final = "final-snapshot" in name
+        is_final = _is_final_snapshot_member(name)
         is_session = "sessions/" in name
         is_trajectory = name.endswith(".trajectory.jsonl")
         if is_final and is_session and not is_trajectory:
@@ -152,7 +190,7 @@ def _load_final_sessions(zf: zipfile.ZipFile) -> dict:
         n for n in zf.namelist()
         if n.endswith("sessions.json") and "sessions/" in n and not n.startswith("__MACOSX")
     ]
-    sessions_candidates.sort(key=lambda n: (0 if "final-snapshot" in n else 1, n))
+    sessions_candidates.sort(key=lambda n: (0 if _is_final_snapshot_member(n) else 1, n))
     if not sessions_candidates:
         return {}
     try:
@@ -165,7 +203,7 @@ def _find_session_near_task_ref(zf: zipfile.ZipFile, task_id: str) -> str | None
     ref_times: list[int] = []
     for name in zf.namelist():
         if (
-            "final-snapshot" in name
+            _is_final_snapshot_member(name)
             and "workspace/trajectories/" in name
             and name.endswith(f"-{task_id}.jsonl")
         ):
@@ -186,11 +224,24 @@ def _find_session_near_task_ref(zf: zipfile.ZipFile, task_id: str) -> str | None
             continue
         started = _normalize_ts(info.get("sessionStartedAt", info.get("createdAt", 0)))
         updated = _normalize_ts(info.get("updatedAt", started))
-        score = min(abs(started - target_ts), abs(updated - target_ts))
+        # Task reference timestamps are session/task start markers. Do not use
+        # updatedAt for matching here: a long earlier session can be updated near
+        # a later task and steal the task assignment.
+        score = abs(started - target_ts)
         scored.append((score, updated, session_id))
 
-    for _score, _updated, session_id in sorted(scored):
-        chosen = _find_jsonl_for_session_id(zf, session_id)
+    ordered_scores = sorted(scored)
+    if not ordered_scores:
+        return None
+    best_score = ordered_scores[0][0]
+    max_distance_ms = 30 * 60 * 1000
+    tie_window_ms = 60 * 1000
+    for score, _updated, session_id in ordered_scores:
+        if score > max_distance_ms:
+            continue
+        if score > best_score + tie_window_ms:
+            continue
+        chosen = _find_jsonl_for_session_id(zf, session_id, require_dialogue=True)
         if chosen:
             logger.info(
                 "Selected session %s nearest task ref %s for %s",
@@ -241,7 +292,7 @@ def _find_session_jsonl(zf: zipfile.ZipFile, task_id: str = "") -> str | None:
     # Strategy 3: Largest .jsonl in final-snapshot sessions/ (standard format preferred)
     final_session_jsonls = [
         n for n in zf.namelist()
-        if "final-snapshot" in n and "sessions/" in n and n.endswith(".jsonl")
+        if _is_final_snapshot_member(n) and "sessions/" in n and n.endswith(".jsonl")
         and not n.endswith(".trajectory.jsonl") and "trajectory-path" not in n
         and not n.startswith("__MACOSX")
     ]
@@ -287,18 +338,19 @@ def _find_session_jsonl(zf: zipfile.ZipFile, task_id: str = "") -> str | None:
     return None
 
 
-def _extract_workspace(zf: zipfile.ZipFile) -> dict[str, str]:
-    """Extract workspace/ files from the zip (handles final-snapshot/workspace/ or initial-snapshot/workspace/)."""
+def _extract_workspace(zf: zipfile.ZipFile, snapshot: str = "final") -> dict[str, str]:
+    """Extract workspace files from the requested snapshot."""
     files = {}
-    # Prefer final-snapshot workspace, fall back to initial-snapshot
     workspace_entries = [
         n for n in zf.namelist()
         if "/workspace/" in n and not n.endswith("/") and not n.startswith("__MACOSX")
     ]
 
-    # Prefer final-snapshot entries
-    final_entries = [n for n in workspace_entries if "final-snapshot" in n]
-    entries_to_use = final_entries if final_entries else workspace_entries
+    if snapshot == "initial":
+        entries_to_use = [n for n in workspace_entries if _is_initial_snapshot_member(n)]
+    else:
+        final_entries = [n for n in workspace_entries if _is_final_snapshot_member(n)]
+        entries_to_use = final_entries if final_entries else workspace_entries
 
     for name in entries_to_use:
         basename = name.split("/workspace/")[-1]
@@ -560,7 +612,7 @@ def _detect_task_id(zf: zipfile.ZipFile) -> str | None:
     final_refs: list[tuple[int, str]] = []
     for name in zf.namelist():
         if (
-            "final-snapshot" in name
+            _is_final_snapshot_member(name)
             and "workspace/trajectories/" in name
             and not name.startswith("__MACOSX")
         ):
@@ -576,6 +628,10 @@ def _detect_task_id(zf: zipfile.ZipFile) -> str | None:
             if tid not in candidates:
                 candidates.append(tid)
         logger.info("Auto-detected task_id(s) in final refs by recency: %s", candidates)
+        for tid in candidates:
+            if _find_session_near_task_ref(zf, tid):
+                return tid
+        logger.warning("No dialogue-backed session found near final task refs; using newest ref")
         return ordered[0][1]
 
     pattern = re.compile(r"(T-\d{3}-\d{2})")
@@ -638,7 +694,15 @@ def parse_export(
         return None
 
     user_msgs, assistant_turns, tool_results, thread_order, session_uuid = _parse_trajectory(events)
-    workspace_files = _extract_workspace(zf)
+    if not user_msgs or not assistant_turns:
+        logger.error(
+            "Selected session has no user/assistant dialogue for %s: %s",
+            submission_id,
+            jsonl_path,
+        )
+        return None
+    workspace_files = _extract_workspace(zf, snapshot="final")
+    workspace_before_files = _extract_workspace(zf, snapshot="initial")
 
     persona_id = None
     m = re.match(r"^T-(\d+)-\d+$", task_id)
@@ -662,6 +726,7 @@ def parse_export(
         session_uuid=session_uuid,
         jsonl_path=jsonl_path,
         workspace_files=workspace_files,
+        workspace_before_files=workspace_before_files,
         user_messages=user_msgs,
         assistant_turns=assistant_turns,
         tool_results_by_call_id=tool_results,

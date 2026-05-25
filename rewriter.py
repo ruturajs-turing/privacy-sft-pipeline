@@ -120,7 +120,7 @@ def _repair_tool_calls_from_original(
 def _determine_scenario(trajectory: ParsedTrajectory, pii_map: PIIMap, turn: AssistantTurn) -> str:
     """Determine which privacy scenario (A-N) best fits this turn."""
     has_persistence = any(
-        tc.name in ("memory_write", "active_memory_write", "active_memory_set", "wiki_apply")
+        tc.name in ("memory_write", "active_memory_write", "active_memory_set", "wiki_apply", "set", "vault_set")
         for tc in turn.tool_calls
     )
     has_t3 = any(
@@ -546,7 +546,7 @@ def _identify_persistence_turns(trajectory: ParsedTrajectory) -> dict[int, str]:
 
     Returns {turn_index: persistence_path} for turns that write to memory/notes paths.
     """
-    PERSISTENCE_TOOLS = {"memory_write", "active_memory_write", "active_memory_set", "wiki_apply"}
+    PERSISTENCE_TOOLS = {"memory_write", "active_memory_write", "active_memory_set", "wiki_apply", "set", "vault_set"}
     result: dict[int, str] = {}
 
     for turn in trajectory.assistant_turns:

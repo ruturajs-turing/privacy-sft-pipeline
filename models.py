@@ -224,3 +224,4 @@ class TaskReport:
     refix_iterations: int = 0
     total_tokens: int = 0
     error_message: str = ""
+    quality_gate_issues: list[dict] = field(default_factory=list)

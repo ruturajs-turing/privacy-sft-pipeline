@@ -11,8 +11,8 @@ Multi-stage pipeline that converts OpenClaw agent trajectories into privacy-comp
 │ Stage 1  │ Stage 2   │ Stage 3     │ Stage 4  │ Stage 5  │ Stage 6             │
 │ Parse    │ Classify  │ Assemble    │ Verify   │ Write    │ RLHF                │
 │          │           │             │          │          │                     │
-│ Extract  │ Claude    │ Privacy     │ GPT-5.4  │ Output   │ 9 rejected alts     │
-│ from GCS │ Opus 4.7  │ Registry    │ verifier │ JSONL +  │ per decision point  │
+│ Extract  │ Claude    │ Privacy     │ GPT-5.4  │ Output   │ 10 rejected alts    │
+│ from GCS │ Opus 4.7  │ Registry    │ verifier │ JSONL +  │ per trajectory      │
 │ zip +    │ + Pattern │ (determin-  │ FREE_BAND│ SFT +    │ + jailbreak pairs   │
 │ persona  │ + Presidio│ istic) +    │ aware    │ workspace│                     │
 │ matching │ provenance│ Claude adv  │          │          │                     │
@@ -63,22 +63,22 @@ The authorization matrix determines what's allowed without consent:
 |------|------|-------|
 | T1 (local) | Free up to L4 | Free up to L2 |
 | T2 (1P cloud) | Free up to L2 | Free up to L2 |
-| T3 (external) | Free up to L2 | Free up to L2 |
+| T3 (external) | Free up to L1 | Free up to L1 |
 
 **Special rules:**
 - T1 write + L3/L4 to **plaintext** (MEMORY.md, .md files, workspace) → **HARD DENY**
-- T1 write + L3/L4 to **encrypted store** (`memory_write` encrypted, `active_memory_write`, `wiki_apply`, `enterprise-vault`) → **CONSENT GATE** (allowed with explicit user consent)
+- T1 write + L3/L4 to **encrypted store** (`set(key,val)` MCP vault, `memory_write` encrypted, `active_memory_write`, `wiki_apply`, `enterprise-vault`) → **CONSENT GATE** (allowed with explicit user consent)
 - T2 + L3/L4 → **CONSENT GATE** (Gate 4b)
-- T3 + L3+ → **CONSENT GATE** (Gate 4c)
+- T3 + L2+ → **CONSENT GATE** (Gate 4c)
 
 ### Tool Trust Tiers (156 tools)
 
 | Tier | Max Data Level | Example Tools |
 |------|----------------|---------------|
-| T1 Local | L4 (ephemeral only) | `exec`, `read`, `write`, `memory_search`, `vault_get` |
-| T1 Persistence | **L2 free**, L3/L4 with **consent + encrypted store** | `memory_write`, `active_memory_write`, `wiki_apply` |
+| T1 Local | L4 (ephemeral only) | `exec`, `read`, `write`, `memory_search`, `vault_get`, `get` |
+| T1 Persistence | **L2 free**, L3/L4 with **consent + encrypted store** | `memory_write`, `active_memory_write`, `wiki_apply`, `set(key,val)` |
 | T2 1P Cloud | L2 free (L3+ with consent) | `enterprise-mail`, `enterprise-rag`, `enterprise-database` |
-| T3 3P API | L2 free (L3+ with consent) | `web_search`, `slack`, `notion`, `github`, `gmail` |
+| T3 3P API | L1 free (L2+ with approval) | `web_search`, `slack`, `notion`, `github`, `gmail` |
 
 ### 5-Step Authorization Procedure
 
@@ -99,8 +99,8 @@ L3/L4 data is valid ONLY if the current user turn supplies it, or if the immedia
 |----------|-----------|----------|
 | **Hard Deny** | L3/L4 write to plaintext, not reused later | Refuse with Hatch string |
 | **Manual Re-input** | L3/L4 write to plaintext, reused 1-2x later | Deny + explain user must re-provide |
-| **Encrypted Store + Consent** | L3/L4 write via `memory_write`, `active_memory_write`, `wiki_apply` | Ask explicit consent, store in encrypted form only |
-| **Vault Redirect** | L3/L4 write, reused 3-4x later | Redirect to `vault_set` / `enterprise-vault` encrypted storage |
+| **Encrypted Store + Consent** | L3/L4 write via `set(key,val)`, `memory_write`, `active_memory_write`, `wiki_apply` | Ask explicit consent, store in encrypted form only |
+| **Vault Redirect** | L3/L4 write, reused 3-4x later | Redirect to MCP vault `set(key,val)` / `enterprise-vault` encrypted storage |
 | **Exception.md** | L3/L4 write, reused 5+ times | Deny + offer documented exception path |
 
 ### Capability-Aware Tool Substitution (Condition 1)
@@ -159,7 +159,7 @@ Each trajectory includes 1-2 synthetic adversarial user attempts where the model
 
 ## RLHF Pair Generation (Stage 6)
 
-At each privacy-critical decision point, the generator creates **9 suboptimal alternatives** showing what the model should NOT do:
+Across each trajectory, the generator creates **10 suboptimal alternatives** spread across the most useful privacy-critical decision points, showing what the model should NOT do:
 
 ### Failure Mode Distribution
 
@@ -296,7 +296,7 @@ Typical costs per trajectory (deterministic assembler is much cheaper than LLM r
 One sample-format Privacy SFT record per passing trajectory, matching `privacy-samples-all.json`: `meta_info`, structured `messages`, `_workspace_before`, `_workspace`, and `_source`. No thinking blocks are emitted.
 
 ### RLHF Pairs (`rlhf/rlhf_pairs.jsonl`)
-Step-level preference pairs with chosen + 9 rejected alternatives per decision point. Includes jailbreak-specific rejected alternatives for adversarial turns.
+Step-level preference pairs with 10 rejected alternatives per trajectory. Includes jailbreak-specific rejected alternatives for adversarial turns.
 
 ### DPO Format (`rlhf/rlhf_dpo.jsonl`)
 One chosen/rejected pair per line, ready for DPO training frameworks (TRL, OpenRLHF, etc.).

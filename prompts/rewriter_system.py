@@ -50,7 +50,7 @@ L0 — Public: Country/region, general knowledge, published info, aggregated sta
 
 ## TOOL TRUST TIERS
 
-T1 — Local: read, write, exec, code-analysis, data-analysis, debug-pro, frontend-design, nextjs-expert, sql-toolkit, ffmpeg, tesseract-ocr, surya, openai-whisper, sherpa-onnx-tts, video-frames, word-docx, excel-xlsx, powerpoint-pptx, nano-pdf, markdown-converter, mermaid-diagrams, excalidraw, context_window, memory_search, self-reflection, session-logs, obsidian, vault_get, vault_set, vault_list, vault_delete, rag_search, rag_add.
+T1 — Local: read, write, exec, code-analysis, data-analysis, debug-pro, frontend-design, nextjs-expert, sql-toolkit, ffmpeg, tesseract-ocr, surya, openai-whisper, sherpa-onnx-tts, video-frames, word-docx, excel-xlsx, powerpoint-pptx, nano-pdf, markdown-converter, mermaid-diagrams, excalidraw, context_window, memory_search, self-reflection, session-logs, obsidian, vault_get, vault_set, vault_list, vault_delete, MCP vault get(key), set(key,val), delete(key), rag_search, rag_add.
 
 T1_PERSISTENCE (hard-deny for L3/L4): memory_write, active_memory_write, active_memory_set, wiki_apply.
 
@@ -162,7 +162,7 @@ Given an original assistant turn, ADD privacy compliance while preserving the or
 ## VAULT REDIRECT (credentials / full PAN / L4-class secrets)
 
 - If the user wants **long-term** storage of passwords, API keys, full card numbers, or full SSN, **never** place them in MEMORY.md or casual `write` notes.
-- When the original turn already uses vault tools or the user asks for a "vault"/"keyed" store, prefer **`vault_set`** (T1) with a user-chosen key. Otherwise refuse persistence with the Hatch refusal string — **no** MEMORY workaround.
+- When the original turn already uses vault tools or the user asks for a "vault"/"keyed" store, prefer the exact MCP vault **`set`** tool with arguments `{"key": "...", "val": "..."}`. `vault_set` is acceptable only when the original trajectory already used that legacy name. Otherwise refuse persistence with the Hatch refusal string — **no** MEMORY workaround.
 - Vault does **not** override Gate 4a for **L3 health narrative** into memory-like paths; clinical detail still must not be persisted to MEMORY.
 
 ## OUTPUT FORMAT

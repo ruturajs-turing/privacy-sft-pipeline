@@ -5,6 +5,7 @@ import datetime
 import json
 import logging
 import random
+import re
 import string
 import time
 import uuid
@@ -22,7 +23,14 @@ from models import (
     RejectedStep,
     RLHFBatchReport,
 )
-from trajectory_structure import normalize_event_stream, validate_event_stream
+from privacy_redaction import (
+    REDACTION_TOKEN,
+    redact_event_stream,
+    redact_file_map,
+    redact_text,
+    redact_value,
+)
+from trajectory_structure import drop_empty_assistant_messages, normalize_event_stream, validate_event_stream
 
 logger = logging.getLogger(__name__)
 _SAMPLE_WORKSPACE_MAX_FILES = 25
@@ -40,8 +48,28 @@ _SAMPLE_SKIP_SUFFIXES = (
 )
 
 
+def _is_memory_file(path: str) -> bool:
+    normalized = path.replace("\\", "/").lstrip("/")
+    return normalized == "MEMORY.md" or normalized.startswith("memory/")
+
+
+def _workspace_redaction_issues(files: dict[str, str], pii_map: PIIMap, label: str) -> list[dict]:
+    issues: list[dict] = []
+    for filename, content in files.items():
+        normalized = filename.replace("\\", "/").lstrip("/")
+        if not _is_memory_file(normalized):
+            continue
+        redacted_name = redact_text(normalized, pii_map)
+        redacted_content = redact_text(str(content), pii_map)
+        if redacted_name != normalized:
+            issues.append({"workspace": label, "path": normalized, "surface": "filename"})
+        if redacted_content != str(content):
+            issues.append({"workspace": label, "path": normalized, "surface": "content"})
+    return issues
+
+
 def _generate_event_id() -> str:
-    return uuid.uuid4().hex[:8]
+    return str(uuid.uuid4())
 
 
 def _sample_workspace_subset(files: dict[str, str]) -> dict[str, str]:
@@ -200,7 +228,8 @@ def _iso_to_ms(value: object) -> int | None:
 # ---------------------------------------------------------------------------
 
 def _tool_call_hex_id() -> str:
-    return f"chatcmpl-tool-{uuid.uuid4().hex[:16]}"
+    chars = string.ascii_letters + string.digits
+    return "call_" + "".join(random.choices(chars, k=18))
 
 
 def _response_id() -> str:
@@ -363,7 +392,15 @@ def _add_sender_metadata_to_users(events: list[dict]) -> None:
         )
         for item in msg.get("content", []):
             if isinstance(item, dict) and item.get("type") == "text":
-                item["text"] = sender_block + item.get("text", "")
+                text = item.get("text", "")
+                if text.startswith("Sender (untrusted metadata):"):
+                    break
+                text = re.sub(
+                    r"^\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC\]\s*",
+                    "",
+                    text,
+                )
+                item["text"] = sender_block + text
                 break
 
 
@@ -396,12 +433,33 @@ def _add_tool_result_details(events: list[dict]) -> None:
             }
 
 
+_SYNTHETIC_FINGERPRINT_KEYS = {
+    "is_adversarial",
+    "attack_type",
+    "is_synthetic",
+    "_synthetic",
+}
+
+
 def _strip_synthetic_fingerprints(events: list[dict]) -> None:
+    """Remove construction-only labels from delivered trajectory events."""
+
+    def scrub(value):
+        if isinstance(value, dict):
+            for key in list(value.keys()):
+                if key in _SYNTHETIC_FINGERPRINT_KEYS:
+                    del value[key]
+                else:
+                    scrub(value[key])
+            for key in list(value.keys()):
+                if key == "metadata" and value[key] == {}:
+                    del value[key]
+        elif isinstance(value, list):
+            for item in value:
+                scrub(item)
+
     for evt in events:
-        msg = evt.get("message", {})
-        if isinstance(msg, dict) and isinstance(msg.get("metadata"), dict):
-            if "is_adversarial" in msg["metadata"]:
-                del msg["metadata"]
+        scrub(evt)
 
 
 def _merge_consecutive_text_messages(events: list[dict]) -> list[dict]:
@@ -556,6 +614,9 @@ def _ensure_assistant_text_after_user(events: list[dict]) -> list[dict]:
         "agent-browser": "Opening that in the browser.",
         "web_search": "Let me search for that.",
         "web_fetch": "Fetching that page.",
+        "get": "Pulling that from the vault.",
+        "set": "Storing that in the vault.",
+        "delete": "Removing that vault key.",
         "vault_set": "Storing that in the vault.",
         "vault_get": "Pulling that from the vault.",
     }
@@ -595,6 +656,59 @@ def _ensure_assistant_text_after_user(events: list[dict]) -> list[dict]:
                 msg["content"] = [{"type": "text", "text": preamble}] + list(content)
 
         result.append(evt)
+    return result
+
+
+def _collapse_consecutive_assistant_messages(events: list[dict]) -> list[dict]:
+    """Merge assistant message runs even when custom events sit between them."""
+
+    def role(event: dict) -> str:
+        msg = event.get("message", {}) if isinstance(event.get("message"), dict) else {}
+        value = msg.get("role") if event.get("type") == "message" else None
+        return value if isinstance(value, str) else ""
+
+    def content(event: dict) -> list:
+        msg = event.get("message", {}) if isinstance(event.get("message"), dict) else {}
+        items = msg.get("content", [])
+        return items if isinstance(items, list) else []
+
+    def has_tool(event: dict) -> bool:
+        return any(isinstance(item, dict) and item.get("type") == "toolCall" for item in content(event))
+
+    def merge_into(target: dict, source: dict, prepend: bool) -> None:
+        target_msg = target.get("message", {})
+        if not isinstance(target_msg, dict):
+            return
+        target_items = list(content(target))
+        source_items = list(content(source))
+        target_msg["content"] = source_items + target_items if prepend else target_items + source_items
+
+    result = list(events)
+    while True:
+        previous_message_idx: int | None = None
+        previous_message_role = ""
+        pair: tuple[int, int] | None = None
+        for idx, event in enumerate(result):
+            current_role = role(event)
+            if current_role not in {"user", "assistant", "toolResult"}:
+                continue
+            if current_role == "assistant" and previous_message_role == "assistant" and previous_message_idx is not None:
+                pair = (previous_message_idx, idx)
+                break
+            previous_message_idx = idx
+            previous_message_role = current_role
+        if pair is None:
+            break
+
+        first_idx, second_idx = pair
+        first = result[first_idx]
+        second = result[second_idx]
+        if has_tool(second) and not has_tool(first):
+            merge_into(second, first, prepend=True)
+            del result[first_idx]
+        else:
+            merge_into(first, second, prepend=False)
+            del result[second_idx]
     return result
 
 
@@ -688,6 +802,7 @@ def _generate_rubric_rationale(dimension: str, score: int) -> str:
 
 def _defingerprint_events(events: list[dict], session_id: str) -> list[dict]:
     """Transform event list to match real delivery trajectory format."""
+    events = json.loads(json.dumps(events))
     id_remap: dict[str, str] = {}
     tc_id_remap: dict[str, str] = {}
 
@@ -727,6 +842,7 @@ def _defingerprint_events(events: list[dict], session_id: str) -> list[dict]:
     result = header + message_events
 
     result = _merge_consecutive_text_messages(result)
+    result = _collapse_consecutive_assistant_messages(result)
     result = _ensure_assistant_text_after_user(result)
     _rebuild_parent_chain(result)
     _assign_realistic_timestamps(result)
@@ -736,6 +852,69 @@ def _defingerprint_events(events: list[dict], session_id: str) -> list[dict]:
     _strip_synthetic_fingerprints(result)
 
     return normalize_event_stream(result)
+
+
+def _defingerprint_patched_events(events: list[dict], session_id: str, base_ms: int | None = None) -> list[dict]:
+    """Apply artifact hygiene to patch-mode events without regenerating the session."""
+    clean_events = json.loads(json.dumps(events))
+    id_remap: dict[str, str] = {}
+    tc_id_remap: dict[str, str] = {}
+
+    has_session = any(evt.get("type") == "session" for evt in clean_events if isinstance(evt, dict))
+    if not has_session:
+        clean_events.insert(0, {
+            "type": "session",
+            "id": session_id,
+            "timestamp": _ts_to_iso(base_ms or _current_ts()),
+        })
+
+    for evt in clean_events:
+        if not isinstance(evt, dict):
+            continue
+        if evt.get("type") == "session":
+            evt["id"] = session_id
+            continue
+        old_id = evt.get("id", "")
+        if old_id and old_id not in id_remap:
+            id_remap[old_id] = _generate_event_id()
+        msg = evt.get("message", {})
+        for item in (msg.get("content", []) if isinstance(msg, dict) else []):
+            if isinstance(item, dict) and item.get("type") == "toolCall":
+                old_tc = item.get("id", "")
+                if old_tc and old_tc not in tc_id_remap:
+                    tc_id_remap[old_tc] = _tool_call_hex_id()
+
+    for evt in clean_events:
+        if not isinstance(evt, dict):
+            continue
+        old_id = evt.get("id", "")
+        if old_id in id_remap:
+            evt["id"] = id_remap[old_id]
+        old_parent = evt.get("parentId", "")
+        if isinstance(old_parent, str) and old_parent in id_remap:
+            evt["parentId"] = id_remap[old_parent]
+        msg = evt.get("message", {})
+        if isinstance(msg, dict):
+            for item in msg.get("content", []):
+                if isinstance(item, dict) and item.get("type") == "toolCall":
+                    old_tc = item.get("id", "")
+                    if old_tc in tc_id_remap:
+                        item["id"] = tc_id_remap[old_tc]
+            if msg.get("role") == "toolResult":
+                old_ref = msg.get("toolCallId", "")
+                if old_ref in tc_id_remap:
+                    msg["toolCallId"] = tc_id_remap[old_ref]
+
+    clean_events = _merge_consecutive_text_messages(clean_events)
+    clean_events = _collapse_consecutive_assistant_messages(clean_events)
+    clean_events = _ensure_assistant_text_after_user(clean_events)
+    _rebuild_parent_chain(clean_events)
+    _assign_realistic_timestamps(clean_events, base_ms)
+    _add_assistant_inference_metadata(clean_events)
+    _add_sender_metadata_to_users(clean_events)
+    _add_tool_result_details(clean_events)
+    _strip_synthetic_fingerprints(clean_events)
+    return normalize_event_stream(clean_events)
 
 
 def _message_role(evt: dict) -> str:
@@ -844,6 +1023,7 @@ def write_trajectory_output(
     if rewrite_result.patched_events is not None:
         # Patch-mode: events are pre-built from original raw events
         jsonl_events = list(rewrite_result.patched_events)
+        jsonl_events = _defingerprint_patched_events(jsonl_events, session_id, base_ts)
     else:
         jsonl_events = []
 
@@ -920,9 +1100,15 @@ def write_trajectory_output(
         # De-fingerprint: realistic IDs, timestamps, metadata, session lifecycle
         jsonl_events = _defingerprint_events(jsonl_events, session_id)
 
-    jsonl_events = normalize_event_stream(jsonl_events)
+    jsonl_events = _collapse_consecutive_assistant_messages(normalize_event_stream(jsonl_events))
+    jsonl_events = drop_empty_assistant_messages(jsonl_events)
     jsonl_events = normalize_event_stream(_ensure_terminal_assistant_message(jsonl_events))
+    jsonl_events = _collapse_consecutive_assistant_messages(jsonl_events)
+    jsonl_events = drop_empty_assistant_messages(jsonl_events)
     _assign_realistic_timestamps(jsonl_events, base_ts)
+    _rebuild_parent_chain(jsonl_events)
+    _strip_synthetic_fingerprints(jsonl_events)
+    jsonl_events = redact_event_stream(jsonl_events, pii_map)
     structure_issues = validate_event_stream(jsonl_events)
     if structure_issues:
         logger.warning(
@@ -958,6 +1144,8 @@ def write_trajectory_output(
     wb_files = _filter_workspace_to_delivery(
         enrich_workspace_files(wb_raw, persona, task_def, "before")
     )
+    wb_files = redact_file_map(wb_files, pii_map)
+    workspace_redaction_issues = _workspace_redaction_issues(wb_files, pii_map, "workspace_before")
     for filename, content in wb_files.items():
         normalized = filename.lstrip("/")
         if _should_skip_workspace_file(normalized):
@@ -975,6 +1163,8 @@ def write_trajectory_output(
     )
     post_files = apply_session_writes(post_files, rewrite_result)
     post_files = enrich_workspace_files(post_files, persona, task_def, "after")
+    post_files = redact_file_map(post_files, pii_map)
+    workspace_redaction_issues.extend(_workspace_redaction_issues(post_files, pii_map, "workspace"))
 
     for filename, content in post_files.items():
         normalized = filename.lstrip("/")
@@ -1002,7 +1192,12 @@ def write_trajectory_output(
             "entity_count": len(pii_map.entities),
             "labels": pii_map.labels_present,
             "entities": [
-                {"text": e.text, "label": e.label, "level": e.level, "engines": e.engines}
+                {
+                    "text": REDACTION_TOKEN if e.level in ("L3", "L4", "BLOCK") else e.text,
+                    "label": e.label,
+                    "level": e.level,
+                    "engines": e.engines,
+                }
                 for e in pii_map.entities
             ],
         },
@@ -1014,6 +1209,10 @@ def write_trajectory_output(
             "issue_count": len(structure_issues),
             "issues": structure_issues[:50],
         },
+        "workspace_redaction_validation": {
+            "issue_count": len(workspace_redaction_issues),
+            "issues": workspace_redaction_issues[:50],
+        },
         "verification": {
             "verdict": verification.verdict,
             "privacy_compliance": verification.privacy_compliance,
@@ -1022,14 +1221,16 @@ def write_trajectory_output(
             "efficiency": verification.efficiency,
             "naturality": verification.naturality,
             "overall": verification.overall,
-            "rationale": verification.rationale,
+            "rationale": redact_value(verification.rationale, pii_map),
             "issue_count": len(verification.issues),
-            "issues": [asdict(issue) for issue in verification.issues],
+            "issues": redact_value([asdict(issue) for issue in verification.issues], pii_map),
         },
         "report": {
             "status": report.status,
             "refix_iterations": report.refix_iterations,
             "total_tokens": report.total_tokens,
+            "quality_gate_issue_count": len(report.quality_gate_issues),
+            "quality_gate_issues": redact_value(report.quality_gate_issues, pii_map),
         },
     }
     (task_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
@@ -1262,6 +1463,7 @@ def write_batch_report(
     minor_fixed = sum(1 for r in reports if r.status == "MINOR_FIXED")
     failed = sum(1 for r in reports if r.status == "FAIL")
     errors = total - passed - minor_fixed - failed
+    quality_gate_blocked = sum(1 for r in reports if r.quality_gate_issues)
 
     batch_report = {
         "total_trajectories": total,
@@ -1269,7 +1471,11 @@ def write_batch_report(
         "minor_fixed": minor_fixed,
         "failed": failed,
         "errors": errors,
+        "quality_gate_blocked": quality_gate_blocked,
+        "clean_pass_rate": f"{passed / max(total, 1) * 100:.1f}%",
         "pass_rate": f"{(passed + minor_fixed) / max(total, 1) * 100:.1f}%",
+        "delivery_ready": failed == 0 and errors == 0,
+        "production_ready": failed == 0 and errors == 0 and quality_gate_blocked == 0,
         "token_usage": token_summary,
         "per_task": [
             {
@@ -1279,6 +1485,8 @@ def write_batch_report(
                 "pii_level": r.max_pii_level,
                 "scenarios": r.scenarios_covered,
                 "refix_iterations": r.refix_iterations,
+                "quality_gate_issue_count": len(r.quality_gate_issues),
+                "quality_gate_issues": r.quality_gate_issues,
                 "error": r.error_message,
             }
             for r in reports

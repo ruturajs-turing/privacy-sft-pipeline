@@ -57,6 +57,45 @@ def test_validator_accepts_openclaw_tool_continuation_chain():
     assert validate_event_stream(events) == []
 
 
+def test_validator_treats_exec_approval_events_as_boundary_between_assistants():
+    events = [
+        {"type": "session", "id": "s1", "timestamp": "2026-04-05T07:00:00.000Z"},
+        {
+            "type": "message",
+            "id": "u1",
+            "parentId": "s1",
+            "timestamp": "2026-04-05T07:00:00.500Z",
+            "message": {"role": "user", "content": [{"type": "text", "text": "start"}]},
+        },
+        {
+            "type": "message",
+            "id": "a-ask",
+            "parentId": "u1",
+            "timestamp": "2026-04-05T07:00:01.000Z",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "Approval required."}]},
+        },
+        {
+            "type": "custom",
+            "customType": "exec.approval.requested",
+            "id": "ap-req",
+            "parentId": "a-ask",
+            "timestamp": "2026-04-05T07:00:01.100Z",
+            "data": {"approvalId": "approval-1", "allowedDecisions": ["allow-once", "deny"]},
+        },
+        {
+            "type": "custom",
+            "customType": "exec.approval.resolved",
+            "id": "ap-res",
+            "parentId": "ap-req",
+            "timestamp": "2026-04-05T07:00:01.200Z",
+            "data": {"approvalId": "approval-1", "decision": "allow-once"},
+        },
+        _assistant_tool("a-run", "ap-res", "tc1", "browser"),
+    ]
+
+    assert validate_event_stream(events) == []
+
+
 def test_writer_defingerprint_preserves_tool_result_interleaving():
     events = [
         {"type": "session", "id": "s1", "timestamp": "2026-04-05T07:00:00.000Z"},
@@ -141,6 +180,33 @@ def test_normalize_repairs_broken_parent_links():
     out = normalize_event_stream(events)
 
     assert out[1]["parentId"] == "s1"
+    assert out[2]["parentId"] == "u1"
+    assert validate_event_stream(out) == []
+
+
+def test_normalize_drops_orphan_tool_results():
+    events = [
+        {"type": "session", "id": "s1", "timestamp": "2026-04-05T07:00:00.000Z"},
+        {
+            "type": "message",
+            "id": "u1",
+            "parentId": "s1",
+            "timestamp": "2026-04-05T07:00:00.500Z",
+            "message": {"role": "user", "content": [{"type": "text", "text": "start"}]},
+        },
+        _tool_result("orphan", "u1", "missing-tool-call", "read"),
+        {
+            "type": "message",
+            "id": "a1",
+            "parentId": "orphan",
+            "timestamp": "2026-04-05T07:00:03.000Z",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "done"}]},
+        },
+    ]
+
+    out = normalize_event_stream(events)
+
+    assert [event["id"] for event in out] == ["s1", "u1", "a1"]
     assert out[2]["parentId"] == "u1"
     assert validate_event_stream(out) == []
 

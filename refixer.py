@@ -200,7 +200,7 @@ def _fix_over_collection(
             if not isinstance(tc, dict):
                 continue
             path = (tc.get("arguments") or {}).get("path", "") or ""
-            if is_persistence_path(path) or tc.get("name") in ("memory_write", "active_memory_write"):
+            if is_persistence_path(path) or tc.get("name") in ("memory_write", "active_memory_write", "set", "vault_set"):
                 persistence_tcs.append(tc)
             else:
                 other_tcs.append(tc)

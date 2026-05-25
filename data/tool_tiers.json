@@ -12,6 +12,7 @@
     "obsidian", "obsidian-vault-maintainer", "wiki-maintainer", "skill-creator", "skill_workshop",
     "rag_search", "rag_add", "rag_get", "rag_delete", "rag_count", "rag_collections",
     "vault_get", "vault_set", "vault_list", "vault_delete",
+    "get", "set", "delete",
     "docker-essentials", "desktop-control", "cron",
     "agent-team-orchestration", "automation-workflows",
     "cfo", "habit-tracker", "health", "healthcheck", "humanizer",

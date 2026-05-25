@@ -171,6 +171,12 @@ TOOL_REGISTRY: dict[str, dict] = {
     "exec": {"tier": "T1", "max_data_level": "L4", "description": "Execute shell command", "distractor_pool": ["github", "api-gateway"]},
     "memory_search": {"tier": "T1", "max_data_level": "L4", "description": "Search agent memory", "distractor_pool": ["enterprise-rag", "web_search"]},
     "memory_write": {"tier": "T1", "max_data_level": "L2", "description": "Write to persistent memory (L2 max for privacy)", "distractor_pool": ["enterprise-rag", "notion"]},
+    "get": {"tier": "T1", "max_data_level": "L4", "description": "MCP vault get(key) -> {value}", "distractor_pool": ["memory_search", "enterprise-vault"]},
+    "set": {"tier": "T1", "max_data_level": "L4", "description": "MCP vault set(key,val) -> {ok}", "distractor_pool": ["memory_write", "enterprise-vault"]},
+    "delete": {"tier": "T1", "max_data_level": "L4", "description": "MCP vault delete(key) -> {ok}", "distractor_pool": ["memory_write", "enterprise-vault"]},
+    "vault_get": {"tier": "T1", "max_data_level": "L4", "description": "Read from encrypted vault", "distractor_pool": ["memory_search", "enterprise-vault"]},
+    "vault_set": {"tier": "T1", "max_data_level": "L4", "description": "Write to encrypted vault", "distractor_pool": ["memory_write", "enterprise-vault"]},
+    "vault_delete": {"tier": "T1", "max_data_level": "L4", "description": "Delete from encrypted vault", "distractor_pool": ["memory_write", "enterprise-vault"]},
     "cron": {"tier": "T1", "max_data_level": "L4", "description": "Schedule tasks", "distractor_pool": ["enterprise-calendar", "trello"]},
     "sessions": {"tier": "T1", "max_data_level": "L4", "description": "Spawn subagent sessions", "distractor_pool": ["slack", "enterprise-inference"]},
 

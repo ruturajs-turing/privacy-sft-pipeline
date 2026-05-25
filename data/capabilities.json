@@ -524,6 +524,29 @@
       "description": "Read a secret/preference by key from the enterprise vault",
       "skills": [
         {
+          "tier": 1,
+          "skill": "mcp-vault",
+          "tool": "get",
+          "params": {
+            "key": "string"
+          },
+          "returns": {
+            "shape": "{value: string | null}",
+            "fields_consumable": [
+              "value"
+            ],
+            "notes": "Exact MCP vault signature from Gio: get(key) -> value or null"
+          },
+          "side_effects": [],
+          "scope": "local encrypted MCP vault",
+          "constraints": [
+            "returns null when the key is absent",
+            "do not disclose L3/L4 values retrieved from prior turns unless the user explicitly asks; prefer elicitation for stale L3/L4"
+          ],
+          "verified": true,
+          "source": "campaign directive 2026-05-25"
+        },
+        {
           "tier": 2,
           "skill": "enterprise-vault",
           "tool": "vault_get",
@@ -555,6 +578,30 @@
       "description": "Store or update a secret/preference in the user scope",
       "skills": [
         {
+          "tier": 1,
+          "skill": "mcp-vault",
+          "tool": "set",
+          "params": {
+            "key": "string",
+            "val": "string"
+          },
+          "returns": {
+            "shape": "{ok: boolean}",
+            "fields_consumable": [],
+            "notes": "Exact MCP vault signature from Gio: set(key,val) -> ok"
+          },
+          "side_effects": [
+            "secret persisted in local encrypted MCP vault"
+          ],
+          "scope": "local encrypted MCP vault",
+          "constraints": [
+            "use only after explicit consent for L3/L4 writes",
+            "never mirror the value into plaintext workspace files or MEMORY.md"
+          ],
+          "verified": true,
+          "source": "campaign directive 2026-05-25"
+        },
+        {
           "tier": 2,
           "skill": "enterprise-vault",
           "tool": "vault_set",
@@ -582,6 +629,28 @@
     "vault.delete": {
       "description": "Delete a secret by key from the user vault",
       "skills": [
+        {
+          "tier": 1,
+          "skill": "mcp-vault",
+          "tool": "delete",
+          "params": {
+            "key": "string"
+          },
+          "returns": {
+            "shape": "{ok: boolean}",
+            "fields_consumable": [],
+            "notes": "Exact MCP vault signature from Gio: delete(key) -> ok"
+          },
+          "side_effects": [
+            "secret removed from local encrypted MCP vault"
+          ],
+          "scope": "local encrypted MCP vault",
+          "constraints": [
+            "returns false if the key did not exist"
+          ],
+          "verified": true,
+          "source": "campaign directive 2026-05-25"
+        },
         {
           "tier": 2,
           "skill": "enterprise-vault",

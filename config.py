@@ -21,6 +21,12 @@ REWRITER_MODEL = "claude-opus-4-7"
 CLASSIFIER_MODEL = "claude-opus-4-7"
 VERIFIER_MODEL = "claude-opus-4-7"
 REFIX_LLM_MODEL = "claude-sonnet-4-20250514"
+OPENCLAW_REPAIR_MODEL = os.getenv("OPENCLAW_REPAIR_MODEL", "claude-opus-4-6")
+OPENCLAW_REPAIR_BACKEND = os.getenv("OPENCLAW_REPAIR_BACKEND", "direct")
+OPENCLAW_CLI_PATH = os.getenv("OPENCLAW_CLI_PATH", str(BASE_DIR.parent / "openclaw" / "openclaw.mjs"))
+OPENCLAW_NODE_PATH = os.getenv("OPENCLAW_NODE_PATH", "")
+OPENCLAW_STATE_DIR = os.getenv("OPENCLAW_STATE_DIR", str(BASE_DIR / ".openclaw-state"))
+OPENCLAW_CLI_TIMEOUT_SECONDS = int(os.getenv("OPENCLAW_CLI_TIMEOUT_SECONDS", "600"))
 
 # Concurrency
 MAX_CONCURRENT_TASKS = int(os.getenv("CONCURRENCY", "8"))

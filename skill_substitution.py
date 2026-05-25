@@ -91,6 +91,15 @@ REVERSE_PATH = DATA_DIR / "skill_capabilities.json"
 
 _catalog_cache: Optional[Catalog] = None
 
+_TOOL_ALIASES = {
+    # OpenClaw runtime names sometimes use skill-level names while the
+    # capability catalog stores the concrete function name.
+    "web_search": "search",
+    "academic-research": "research",
+    "edge-tts": "speak",
+    "openai-whisper-api": "transcribe",
+}
+
 
 def load_catalog(path: Path = CATALOG_PATH) -> Catalog:
     global _catalog_cache
@@ -239,10 +248,14 @@ def trace_consumed_fields(result_text: str, subsequent_text: str) -> list[str] |
 def _find_entry(
     catalog: Catalog, tool_name: str, tier_hint: int | None = None,
 ) -> tuple[str, CapabilityEntry] | None:
+    lookup_names = [tool_name]
+    alias = _TOOL_ALIASES.get(tool_name)
+    if alias and alias != tool_name:
+        lookup_names.append(alias)
     hits: list[tuple[str, CapabilityEntry]] = []
     for cap_id, cap in catalog.capabilities.items():
         for entry in cap.skills:
-            if entry.tool == tool_name:
+            if entry.tool in lookup_names:
                 hits.append((cap_id, entry))
     if not hits:
         return None
@@ -329,7 +342,7 @@ def evaluate(
             tier=alt.tier,
             verdict=verdict,
             reason=reason,
-            param_map=alt.param_map,
+            param_map=alt.param_map or orig.param_map,
         ))
     candidates.sort(key=lambda c: c.tier)
     return SubstitutionResult(
@@ -360,10 +373,16 @@ def build_result_index(trajectory) -> tuple[dict[str, tuple[int, str]], list[tup
     for turn in trajectory.assistant_turns:
         idx = turn.turn_index
 
-        if turn.text:
+        if hasattr(turn, "text") and turn.text:
             all_texts.append((idx, turn.text))
-        if hasattr(turn, 'thinking') and turn.thinking:
+        for text in getattr(turn, "text_blocks", []) or []:
+            if text:
+                all_texts.append((idx, text))
+        if hasattr(turn, "thinking") and turn.thinking:
             all_texts.append((idx, turn.thinking))
+        for thinking in getattr(turn, "thinking_blocks", []) or []:
+            if thinking:
+                all_texts.append((idx, thinking))
 
         for tc in turn.tool_calls:
             args_text = json.dumps(tc.arguments or {}, ensure_ascii=False)

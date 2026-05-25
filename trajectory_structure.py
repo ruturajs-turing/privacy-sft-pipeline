@@ -41,6 +41,11 @@ def _content(event: dict[str, Any]) -> list[dict[str, Any]]:
     return content if isinstance(content, list) else []
 
 
+def _is_approval_custom_event(event: dict[str, Any]) -> bool:
+    custom_type = event.get("customType")
+    return isinstance(custom_type, str) and custom_type.startswith("exec.approval.")
+
+
 def validate_event_stream(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Return structural issues in an OpenClaw JSONL event stream.
 
@@ -78,6 +83,9 @@ def validate_event_stream(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "id": event_id,
                 "parentId": parent,
             })
+
+        if event.get("type") == "custom" and _is_approval_custom_event(event):
+            previous_message_role = None
 
         if event.get("type") == "message":
             msg = event.get("message")
@@ -245,8 +253,8 @@ def drop_empty_assistant_messages(events: list[dict[str, Any]]) -> list[dict[str
                 and (
                     item.get("type") == "toolCall"
                     or (
-                        item.get("type") in {"text", "thinking", "image"}
-                        and str(item.get("text") or item.get("thinking") or item.get("url") or "").strip()
+                        item.get("type") in {"text", "image"}
+                        and str(item.get("text") or item.get("url") or "").strip()
                     )
                 )
                 for item in content
@@ -337,6 +345,34 @@ def collapse_consecutive_text_assistant_messages(events: list[dict[str, Any]]) -
     return kept
 
 
+def drop_orphan_tool_results(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop toolResult events whose toolCallId is not present earlier in stream."""
+    kept: list[dict[str, Any]] = []
+    seen_tool_call_ids: set[str] = set()
+
+    for original in events:
+        if not isinstance(original, dict):
+            continue
+        event = deepcopy(original)
+
+        if _message_role(event) == "assistant":
+            for item in _content(event):
+                if isinstance(item, dict) and item.get("type") == "toolCall":
+                    tc_id = item.get("id")
+                    if isinstance(tc_id, str) and tc_id:
+                        seen_tool_call_ids.add(tc_id)
+
+        if _message_role(event) == "toolResult":
+            msg = event.get("message", {})
+            tc_id = msg.get("toolCallId") if isinstance(msg, dict) else None
+            if not isinstance(tc_id, str) or tc_id not in seen_tool_call_ids:
+                continue
+
+        kept.append(event)
+
+    return kept
+
+
 def repair_parent_chain(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Fill missing/broken parent links without changing event order or tool grouping."""
     repaired = deepcopy(events)
@@ -368,4 +404,5 @@ def normalize_event_stream(events: list[dict[str, Any]]) -> list[dict[str, Any]]
     branch = select_active_branch(events)
     pruned = drop_empty_assistant_messages(branch)
     collapsed = collapse_consecutive_text_assistant_messages(pruned)
-    return repair_parent_chain(collapsed)
+    without_orphans = drop_orphan_tool_results(collapsed)
+    return repair_parent_chain(without_orphans)

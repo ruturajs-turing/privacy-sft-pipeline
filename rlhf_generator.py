@@ -34,7 +34,8 @@ from prompts.rlhf_system import RLHF_SYSTEM_PROMPT, build_rlhf_user_prompt
 
 logger = logging.getLogger("rlhf_generator")
 
-ALTERNATIVES_PER_STEP = 9
+TARGET_REJECTED_PER_TRAJECTORY = 10
+MAX_ALTERNATIVES_PER_STEP = 10
 MIN_CRITICALITY_THRESHOLD = 0.3
 
 
@@ -198,7 +199,7 @@ def _get_tool_response_text(tool_call: dict, turn: RewrittenTurn) -> str:
 async def generate_rejected_alternatives(
     point: DecisionPoint,
     client: AsyncAnthropic,
-    num_alternatives: int = ALTERNATIVES_PER_STEP,
+    num_alternatives: int = MAX_ALTERNATIVES_PER_STEP,
 ) -> list[RejectedStep]:
     """Call Claude Opus 4.6 to generate rejected alternatives for a decision point."""
 
@@ -320,7 +321,7 @@ async def generate_rlhf_pairs(
     trajectory: ParsedTrajectory,
     rewrite_result: RewriteResult,
     pii_map: PIIMap,
-    max_pairs_per_trajectory: int = 50,
+    max_pairs_per_trajectory: int = TARGET_REJECTED_PER_TRAJECTORY,
 ) -> list[RLHFPair]:
     """Generate RLHF preference pairs for an entire trajectory.
 
@@ -343,16 +344,21 @@ async def generate_rlhf_pairs(
     if not decision_points:
         return []
 
-    budget_per_point = max(3, max_pairs_per_trajectory // len(decision_points))
-    budget_per_point = min(budget_per_point, ALTERNATIVES_PER_STEP)
+    selected_points = decision_points[:max(1, min(len(decision_points), max_pairs_per_trajectory))]
+    base_budget = max_pairs_per_trajectory // len(selected_points)
+    remainder = max_pairs_per_trajectory % len(selected_points)
+    budgets = [
+        min(MAX_ALTERNATIVES_PER_STEP, base_budget + (1 if i < remainder else 0))
+        for i in range(len(selected_points))
+    ]
 
     pairs: list[RLHFPair] = []
     sem = asyncio.Semaphore(3)
 
-    async def _generate_for_point(point: DecisionPoint) -> RLHFPair | None:
+    async def _generate_for_point(point: DecisionPoint, budget: int) -> RLHFPair | None:
         async with sem:
             alternatives = await generate_rejected_alternatives(
-                point, client, num_alternatives=budget_per_point
+                point, client, num_alternatives=budget
             )
             if not alternatives:
                 return None
@@ -379,7 +385,10 @@ async def generate_rlhf_pairs(
                 tool_tier_involved=point.tool_tier,
             )
 
-    tasks = [_generate_for_point(p) for p in decision_points]
+    tasks = [
+        _generate_for_point(point, budget)
+        for point, budget in zip(selected_points, budgets)
+    ]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     for result in results:

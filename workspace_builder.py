@@ -241,46 +241,67 @@ def apply_session_writes(
     rewrite_result,
 ) -> dict[str, str]:
     """Merge write/memory_write tool payloads into workspace files."""
+    def _iter_tool_calls():
+        patched_events = getattr(rewrite_result, "patched_events", None)
+        if patched_events is not None:
+            for evt in patched_events:
+                msg = evt.get("message", {}) if isinstance(evt, dict) else {}
+                if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                    continue
+                content = msg.get("content", [])
+                if not isinstance(content, list):
+                    continue
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "toolCall":
+                        yield item
+            return
+
+        for rt in rewrite_result.turns:
+            for tc in rt.tool_calls:
+                if isinstance(tc, dict):
+                    yield tc
+
     result = dict(files)
-    for rt in rewrite_result.turns:
-        for tc in rt.tool_calls:
-            if not isinstance(tc, dict):
+    for tc in _iter_tool_calls():
+        name = tc.get("name", "")
+        args = tc.get("arguments", {}) or {}
+        if name == "write":
+            raw_path = args.get("file_path", args.get("path", ""))
+            content = args.get("content", "")
+            if not raw_path or not content or len(content.strip()) < 20:
                 continue
-            name = tc.get("name", "")
-            args = tc.get("arguments", {}) or {}
-            if name == "write":
-                raw_path = args.get("file_path", args.get("path", ""))
-                content = args.get("content", "")
-                if not raw_path or not content or len(content.strip()) < 20:
+            clean = raw_path
+            for prefix in (
+                "/home/user/OpenClawTrainer/workspace/",
+                "/home/user/.openclaw/workspace/",
+                "/workspace/",
+            ):
+                if clean.startswith(prefix):
+                    clean = clean[len(prefix):]
+            clean = clean.lstrip("/")
+            if clean and not clean.startswith(".."):
+                base = clean.split("/")[-1]
+                if base in (
+                    "USER.md", "MEMORY.md", "IDENTITY.md",
+                ) and is_blank_user_md(content):
                     continue
-                clean = raw_path
-                for prefix in (
-                    "/home/user/OpenClawTrainer/workspace/",
-                    "/home/user/.openclaw/workspace/",
-                    "/workspace/",
-                ):
-                    if clean.startswith(prefix):
-                        clean = clean[len(prefix):]
-                clean = clean.lstrip("/")
-                if clean and not clean.startswith(".."):
-                    base = clean.split("/")[-1]
-                    if base in (
-                        "USER.md", "MEMORY.md", "IDENTITY.md",
-                    ) and is_blank_user_md(content):
-                        continue
-                    result[clean] = content
-            elif name in ("memory_write", "active_memory_write"):
-                key = args.get("key", "")
-                value = args.get("value", "")
-                if not key or not value:
-                    continue
-                if isinstance(value, dict):
-                    value = json.dumps(value, indent=2)
-                block = f"\n\n### {key}\n{value}\n"
-                mem = result.get("MEMORY.md", result.get("memory.md", ""))
-                if "MEMORY" not in mem.upper():
-                    mem = build_memory_md_profile({}, {}, "blank")
-                result["MEMORY.md"] = mem.rstrip() + block
+                result[clean] = content
+        elif name in ("vault_set", "set"):
+            # Encrypted vault writes are represented by tool calls only. They
+            # should not materialize as plaintext workspace or MEMORY.md files.
+            continue
+        elif name in ("memory_write", "active_memory_write", "active_memory_set"):
+            key = args.get("key", "")
+            value = args.get("value", args.get("val", ""))
+            if not key or not value:
+                continue
+            if isinstance(value, dict):
+                value = json.dumps(value, indent=2)
+            block = f"\n\n### {key}\n{value}\n"
+            mem = result.get("MEMORY.md", result.get("memory.md", ""))
+            if "MEMORY" not in mem.upper():
+                mem = build_memory_md_profile({}, {}, "blank")
+            result["MEMORY.md"] = mem.rstrip() + block
     return result
 
 

@@ -22,7 +22,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskPr
 from rich.logging import RichHandler
 
 from config import MAX_CONCURRENT_TASKS, MAX_REFIX_ITERATIONS, MIN_PRIVACY_COMPLIANCE, OUTPUT_DIR
-from models import TaskReport, VerificationResult
+from models import TaskReport, VerificationIssue, VerificationResult
 from token_tracker import tracker
 
 console = Console()
@@ -89,7 +89,11 @@ def _save_checkpoint(output_dir: Path, completed: set[str]) -> None:
 
 async def _process_single_task(
     row: dict, output_dir: Path, dry_run: bool = False, generate_rlhf: bool = False,
-    single_shot: bool = False,
+    single_shot: bool = False, openclaw_repair: bool = False,
+    openclaw_repair_model: str | None = None, openclaw_repair_attempts: int = 2,
+    openclaw_repair_backend: str = "direct",
+    openclaw_generate: bool = False,
+    openclaw_generation_model: str | None = None,
 ) -> TaskReport:
     """Process a single trajectory through all pipeline stages."""
     from parser import parse_export
@@ -202,10 +206,20 @@ async def _process_single_task(
 
     # Stage 3: Rewrite trajectory for privacy compliance
     if single_shot:
-        logger.info("[%s] Stage 3: Single-shot LLM rewrite (full context)...", task_id)
+        generation_backend = "cli" if openclaw_generate else "direct"
+        generation_model = openclaw_generation_model or openclaw_repair_model
+        if openclaw_generate:
+            logger.info("[%s] Stage 3: Single-shot OpenClaw CLI rewrite (persona/workspace context)...", task_id)
+        else:
+            logger.info("[%s] Stage 3: Single-shot LLM rewrite (full context)...", task_id)
         try:
             from single_shot_rewriter import rewrite_trajectory_single_shot
-            rewrite_result = await rewrite_trajectory_single_shot(trajectory, pii_map)
+            rewrite_result = await rewrite_trajectory_single_shot(
+                trajectory,
+                pii_map,
+                generation_backend=generation_backend,
+                generation_model=generation_model,
+            )
         except Exception as e:
             import traceback
             logger.error("[%s] SINGLE_SHOT_ERROR traceback:\n%s", task_id, traceback.format_exc())
@@ -230,6 +244,21 @@ async def _process_single_task(
             rewrite_result = await review_and_fix(trajectory, rewrite_result, pii_map)
         except Exception as e:
             logger.warning("[%s] Reviewer failed (non-fatal): %s", task_id, e)
+
+    def _apply_deterministic_repairs(stage_label: str) -> None:
+        nonlocal rewrite_result
+        try:
+            from privacy_quality_gates import repair_quality_issues
+            rewrite_result, repairs = repair_quality_issues(trajectory, rewrite_result, pii_map)
+            if repairs:
+                logger.info(
+                    "[%s] %s: deterministic auto-repaired %d issue(s)",
+                    task_id, stage_label, len(repairs),
+                )
+        except Exception as e:
+            logger.warning("[%s] %s: deterministic auto-repair failed: %s", task_id, stage_label, e)
+
+    _apply_deterministic_repairs("Stage 3c")
 
     report.scenarios_covered = rewrite_result.scenarios_covered
     report.privacy_decision_points = rewrite_result.privacy_decision_points
@@ -271,6 +300,7 @@ async def _process_single_task(
             trajectory = new_trajectory
             pii_map = await classify_trajectory(trajectory)
             rewrite_result = await assemble_trajectory(trajectory, pii_map)
+            _apply_deterministic_repairs(f"Stage 4a retry {synth_retry_count}")
             verification = await verify_trajectory(trajectory, rewrite_result, pii_map)
             logger.info(
                 "[%s] Retry %d result: %s (privacy=%d/5, overall=%.1f)",
@@ -293,6 +323,7 @@ async def _process_single_task(
             rewrite_result = await refix_trajectory(
                 trajectory, pii_map, rewrite_result, verification
             )
+            _apply_deterministic_repairs(f"Stage 4b iteration {refix_count}")
             verification = await verify_trajectory(trajectory, rewrite_result, pii_map)
             logger.info(
                 "[%s] Re-verified: %s (privacy=%d/5, overall=%.1f)",
@@ -316,6 +347,107 @@ async def _process_single_task(
 
     report.refix_iterations = refix_count
 
+    # Stage 4b.5: OpenClaw verifier-failure repair.
+    # Deterministic gates catch known privacy hazards, but the verifier can still
+    # reject a trajectory for state/tool inconsistency or unnatural patched flow.
+    # Give Opus a bounded patch pass, then re-run deterministic repair and verify.
+    if verification.verdict == "FAIL" and openclaw_repair and rewrite_result.patched_events:
+        verifier_issues = verification.issues or [
+            VerificationIssue(
+                turn_index=-1,
+                rule_violated="verifier_fail",
+                severity="critical",
+                description=verification.rationale,
+                fix_instruction="Repair the smallest set of assistant/tool events needed to make the trajectory coherent and privacy-compliant.",
+            )
+        ]
+        for attempt in range(max(1, openclaw_repair_attempts)):
+            logger.warning(
+                "[%s] OpenClaw verifier repair attempt %d for FAIL verdict",
+                task_id, attempt + 1,
+            )
+            try:
+                from openclaw_repair_worker import repair_with_openclaw
+                candidate_rewrite, repairs = await repair_with_openclaw(
+                    trajectory,
+                    rewrite_result,
+                    pii_map,
+                    verifier_issues,
+                    model=openclaw_repair_model,
+                    backend=openclaw_repair_backend,
+                    issue_source="verifier_fail",
+                    failure_rationale=verification.rationale,
+                )
+                if not repairs:
+                    break
+                rewrite_result = candidate_rewrite
+                _apply_deterministic_repairs(f"OpenClaw verifier repair attempt {attempt + 1}")
+                repaired_verification = await verify_trajectory(trajectory, rewrite_result, pii_map)
+                logger.info(
+                    "[%s] OpenClaw verifier repair result: %s (privacy=%d/5, overall=%.1f)",
+                    task_id,
+                    repaired_verification.verdict,
+                    repaired_verification.privacy_compliance,
+                    repaired_verification.overall,
+                )
+                verification = repaired_verification
+                verifier_issues = verification.issues or verifier_issues
+                if verification.verdict != "FAIL":
+                    break
+            except Exception as repair_error:
+                logger.error("[%s] OpenClaw verifier repair failed: %s", task_id, repair_error)
+                break
+
+    # Stage 4c: Deterministic production quality gates.
+    # These are non-negotiable rules that block packaging even if the LLM
+    # verifier misses a known privacy/security failure mode.
+    try:
+        from privacy_quality_gates import apply_quality_gates, issues_as_dicts, run_quality_gates
+        gate_issues = run_quality_gates(trajectory, rewrite_result, pii_map)
+        if gate_issues and openclaw_repair:
+            for attempt in range(max(1, openclaw_repair_attempts)):
+                logger.warning(
+                    "[%s] OpenClaw repair attempt %d for %d gate issue(s)",
+                    task_id, attempt + 1, len(gate_issues),
+                )
+                try:
+                    from openclaw_repair_worker import repair_with_openclaw
+                    rewrite_result, repairs = await repair_with_openclaw(
+                        trajectory,
+                        rewrite_result,
+                        pii_map,
+                        gate_issues,
+                        model=openclaw_repair_model,
+                        backend=openclaw_repair_backend,
+                    )
+                    if not repairs:
+                        break
+                    _apply_deterministic_repairs(f"OpenClaw repair attempt {attempt + 1}")
+                    gate_issues = run_quality_gates(trajectory, rewrite_result, pii_map)
+                    if not gate_issues:
+                        logger.info("[%s] OpenClaw repair cleared deterministic gate issues", task_id)
+                        verification = await verify_trajectory(trajectory, rewrite_result, pii_map)
+                        break
+                except Exception as repair_error:
+                    logger.error("[%s] OpenClaw repair failed: %s", task_id, repair_error)
+                    break
+        if gate_issues:
+            logger.warning("[%s] Deterministic QA gate found %d issue(s)", task_id, len(gate_issues))
+            report.quality_gate_issues = issues_as_dicts(gate_issues)
+            verification = apply_quality_gates(verification, gate_issues)
+    except Exception as e:
+        logger.error("[%s] Deterministic QA gate failed: %s", task_id, e)
+        verification = VerificationResult(
+            verdict="FAIL",
+            privacy_compliance=0,
+            correctness=verification.correctness,
+            completeness=verification.completeness,
+            efficiency=verification.efficiency,
+            naturality=verification.naturality,
+            overall=0.0,
+            rationale=f"Deterministic QA gate failed: {e}",
+        )
+
     report.verification_scores = {
         "privacy_compliance": verification.privacy_compliance,
         "correctness": verification.correctness,
@@ -326,7 +458,7 @@ async def _process_single_task(
     }
 
     if verification.verdict == "PASS":
-        report.status = "PASS" if refix_count == 0 else "MINOR_FIXED"
+        report.status = "PASS"
     elif verification.verdict == "MINOR_ISSUES":
         report.status = "MINOR_FIXED"
     else:
@@ -346,7 +478,7 @@ async def _process_single_task(
 
             rlhf_pairs = await generate_rlhf_pairs(
                 trajectory, rewrite_result, pii_map,
-                max_pairs_per_trajectory=50,
+                max_pairs_per_trajectory=10,
             )
 
             if rlhf_pairs:
@@ -356,7 +488,7 @@ async def _process_single_task(
                 )
                 rlhf_report = compute_batch_report(task_id, submission_id, rlhf_pairs)
 
-                rlhf_output_dir = output_dir / "_pipeline" / "rlhf"
+                rlhf_output_dir = output_dir / submission_id
                 write_rlhf_pairs(rlhf_output_dir, rlhf_pairs, rlhf_report)
 
                 total_rejected = sum(len(p.rejected) for p in rlhf_pairs)
@@ -384,6 +516,12 @@ async def run_pipeline(
     generate_rlhf: bool = False,
     synthetic_mode: bool = False,
     single_shot: bool = False,
+    openclaw_repair: bool = False,
+    openclaw_repair_model: str | None = None,
+    openclaw_repair_attempts: int = 2,
+    openclaw_repair_backend: str = "direct",
+    openclaw_generate: bool = False,
+    openclaw_generation_model: str | None = None,
 ) -> None:
     """Main pipeline orchestrator."""
     from llm_retry import set_api_concurrency
@@ -420,8 +558,10 @@ async def run_pipeline(
     if hasattr(run_pipeline, '_limit') and run_pipeline._limit > 0:
         pending = pending[:run_pipeline._limit]
 
-    logger.info("Processing %d tasks (concurrency: %d, RLHF: %s, synthetic: %s)",
-                len(pending), concurrency, generate_rlhf, synthetic_mode)
+    logger.info(
+        "Processing %d tasks (concurrency: %d, RLHF: %s, synthetic: %s, OpenClaw generation: %s)",
+        len(pending), concurrency, generate_rlhf, synthetic_mode, openclaw_generate,
+    )
 
     # Process with semaphore
     sem = asyncio.Semaphore(concurrency)
@@ -429,7 +569,19 @@ async def run_pipeline(
 
     async def _bounded_process(row: dict) -> TaskReport:
         async with sem:
-            return await _process_single_task(row, output_dir, dry_run, generate_rlhf, single_shot)
+            return await _process_single_task(
+                row,
+                output_dir,
+                dry_run,
+                generate_rlhf,
+                single_shot,
+                openclaw_repair,
+                openclaw_repair_model,
+                openclaw_repair_attempts,
+                openclaw_repair_backend,
+                openclaw_generate,
+                openclaw_generation_model,
+            )
 
     with Progress(
         SpinnerColumn(),
@@ -484,6 +636,18 @@ def main():
                              "Input should be tasks_all.csv with task_id, goal_summary, etc.")
     parser.add_argument("--single-shot", action="store_true",
                         help="Use single-shot LLM rewrite (sends full trajectory + all context in one call)")
+    parser.add_argument("--openclaw-repair", action="store_true",
+                        help="Use an Opus-backed OpenClaw repair worker for final deterministic gate failures")
+    parser.add_argument("--openclaw-repair-model", default=None,
+                        help="Anthropic model for OpenClaw repair worker (default: OPENCLAW_REPAIR_MODEL or claude-opus-4-6)")
+    parser.add_argument("--openclaw-repair-attempts", type=int, default=2,
+                        help="Max OpenClaw repair attempts for verifier failures or remaining deterministic gate failures")
+    parser.add_argument("--openclaw-repair-backend", choices=["direct", "cli"], default="direct",
+                        help="Repair backend: direct Anthropic SDK or real OpenClaw CLI local agent")
+    parser.add_argument("--openclaw-generate", action="store_true",
+                        help="Use the real OpenClaw CLI local agent as the Stage 3 patch-text generation backend")
+    parser.add_argument("--openclaw-generation-model", default=None,
+                        help="Anthropic model for OpenClaw Stage 3 generation (default: repair model or OpenClaw config default)")
     parser.add_argument("--limit", "-n", type=int, default=0,
                         help="Limit to first N tasks (useful for testing synthetic mode)")
 
@@ -494,6 +658,8 @@ def main():
         sys.exit(1)
 
     run_pipeline._limit = args.limit
+    if args.openclaw_generate:
+        args.single_shot = True
 
     asyncio.run(run_pipeline(
         input_path=args.input,
@@ -505,6 +671,12 @@ def main():
         generate_rlhf=args.rlhf and not args.no_rlhf,
         synthetic_mode=args.synthetic,
         single_shot=args.single_shot,
+        openclaw_repair=args.openclaw_repair,
+        openclaw_repair_model=args.openclaw_repair_model,
+        openclaw_repair_attempts=args.openclaw_repair_attempts,
+        openclaw_repair_backend=args.openclaw_repair_backend,
+        openclaw_generate=args.openclaw_generate,
+        openclaw_generation_model=args.openclaw_generation_model,
     ))
 
 

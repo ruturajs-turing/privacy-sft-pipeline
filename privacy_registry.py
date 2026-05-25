@@ -83,16 +83,16 @@ _PERSISTENCE_PATTERNS = (
 
 _PERSISTENCE_TOOLS = frozenset({
     "memory_write", "active_memory_write", "active_memory_set", "wiki_apply",
-    "enterprise-vault", "vault_set", "vault_store",
+    "enterprise-vault", "set", "vault_set", "vault_store",
 })
 
 _ENCRYPTED_PERSISTENCE_TOOLS = frozenset({
     "active_memory_write", "active_memory_set", "wiki_apply",
-    "enterprise-vault", "vault_set", "vault_store",
+    "enterprise-vault", "set", "vault_set", "vault_store",
 })
 
 _READ_TOOLS = frozenset({
-    "read", "memory_search", "rag_search", "vault_get", "vault_list",
+    "read", "memory_search", "rag_search", "get", "vault_get", "vault_list",
     "context_window", "context_window_introspection", "session-logs",
 })
 

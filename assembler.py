@@ -40,7 +40,7 @@ HATCH_REFUSAL = (
 _DB_PATH = Path(__file__).resolve().parent.parent / "tool_calls.db"
 _WRITE_TOOLS = {
     "write", "edit", "memory_write", "active_memory_write",
-    "active_memory_set", "wiki_apply", "vault_set",
+    "active_memory_set", "wiki_apply", "set", "vault_set",
 }
 _MAX_ELICIT_TURNS = 0
 
@@ -672,7 +672,7 @@ def _build_minimized_tool_calls(
         tc_dict = {"id": tc.call_id, "name": tc.name, "arguments": copy.deepcopy(tc.arguments or {})}
         path = (tc.arguments or {}).get("path", "") or (tc.arguments or {}).get("file_path", "") or ""
 
-        if is_persistence_path(path) or tc.name in ("memory_write", "active_memory_write"):
+        if is_persistence_path(path) or tc.name in ("memory_write", "active_memory_write", "set", "vault_set"):
             content = tc_dict["arguments"].get("content", "")
             if content:
                 tc_dict["arguments"]["content"] = _minimize_write_content(
@@ -1505,19 +1505,19 @@ async def assemble_trajectory(
             vault_key = decision.vault_key or "user_data"
             vault_tc = {
                 "id": f"vault_{turn.turn_index}",
-                "name": "vault_set",
-                "arguments": {"key": vault_key, "value": "[VAULT-ENCRYPTED]"},
+                "name": "set",
+                "arguments": {"key": vault_key, "val": "[VAULT-ENCRYPTED]"},
             }
             vault_result = {
                 "call_id": f"vault_{turn.turn_index}",
-                "tool_name": "vault_set",
+                "tool_name": "set",
                 "content": json.dumps({"ok": True, "key": vault_key}),
                 "is_error": False,
             }
             text = (
                 f"can't save {decision.data_level} data to plaintext memory, but since you'll "
                 f"need it later — stored it in your encrypted vault under `{vault_key}`. "
-                f"future reads will use `vault_get`."
+                f"future reads will use `get`."
             )
             rewritten_turns.append(RewrittenTurn(
                 turn_index=turn.turn_index,
@@ -1561,7 +1561,7 @@ async def assemble_trajectory(
 
         elif decision.action == Action.SUPPRESS:
             # Drop write tools, keep reads and conversational text
-            _WRITE_TOOLS = {"write", "edit", "memory_write", "active_memory_write", "active_memory_set", "wiki_apply"}
+            _WRITE_TOOLS = {"write", "edit", "memory_write", "active_memory_write", "active_memory_set", "wiki_apply", "set", "vault_set"}
             kept_tcs = []
             kept_results = []
             for tc in turn.tool_calls:
@@ -1642,7 +1642,7 @@ async def assemble_trajectory(
 
     # Remove read-only tool turns immediately following a hard_deny
     # (e.g. redundant memory_search after denying persistence)
-    _READ_ONLY_TOOLS = {"memory_search", "rag_search", "read", "vault_get"}
+    _READ_ONLY_TOOLS = {"memory_search", "rag_search", "read", "get", "vault_get"}
     filtered = []
     for i, t in enumerate(rewritten_turns):
         if (

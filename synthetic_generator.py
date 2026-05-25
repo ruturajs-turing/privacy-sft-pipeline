@@ -47,6 +47,10 @@ _cached_cuarena_openers: list[str] | None = None
 _cached_tasks_json: dict[str, dict] | None = None
 
 
+def _opaque_tool_call_id() -> str:
+    return f"call_{uuid.uuid4().hex[:18]}"
+
+
 def _get_db() -> sqlite3.Connection | None:
     if _DB_PATH.exists():
         return sqlite3.connect(str(_DB_PATH))
@@ -1195,7 +1199,7 @@ Return ONLY the JSON array."""
 
             for tc_data in tool_calls_data:
                 call_counter += 1
-                call_id = f"call_synth_{session_uuid[:8]}_{call_counter}"
+                call_id = _opaque_tool_call_id()
                 tc = ToolCall(
                     call_id=call_id,
                     name=tc_data.get("name", "unknown"),
@@ -1348,6 +1352,18 @@ def _tool_template(
         args = {"key": "expired_token"}
         return args, json.dumps({"status": "deleted", "key": "expired_token"}), "Cleaning up expired vault entries."
 
+    if tool_name == "get":
+        args = {"key": "api_credentials"}
+        return args, json.dumps({"value": None}), "Checking the vault for stored credentials."
+
+    if tool_name == "set":
+        args = {"key": "session_token", "val": "[REDACTED]"}
+        return args, json.dumps({"ok": True}), "Storing the value in the vault."
+
+    if tool_name == "delete":
+        args = {"key": "expired_token"}
+        return args, json.dumps({"ok": True}), "Deleting the old vault key."
+
     if tool_name == "summarize":
         args = {"text": f"Summary request for: {short_goal}", "max_length": 200}
         return args, f"Summary: {short_goal[:100]}...", "Summarizing the relevant information."
@@ -1416,7 +1432,7 @@ def _patch_missing_tools(
 
     for tool_name in sorted(missing_tools):
         call_counter += 1
-        call_id = f"call_synth_{session_uuid[:8]}_{call_counter}"
+        call_id = _opaque_tool_call_id()
         turn_index = len(trajectory.assistant_turns)
 
         args, result_text, assistant_text = _tool_template(

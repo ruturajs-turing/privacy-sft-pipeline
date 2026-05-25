@@ -498,7 +498,7 @@ def _determine_source_type(tool_name: str | None, is_user_msg: bool) -> str:
         return "user_input"
     if not tool_name:
         return "assistant_text"
-    memory_read_tools = {"memory_search", "rag_search", "vault_get", "vault_list"}
+    memory_read_tools = {"memory_search", "rag_search", "get", "vault_get", "vault_list"}
     if tool_name in memory_read_tools:
         return "memory_read"
     return "tool_result"

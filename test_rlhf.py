@@ -22,6 +22,10 @@ logger = logging.getLogger("test_rlhf")
 TEST_SUBMISSION = "347d195e-031d-4ad4-966b-bf85c050e604"
 TEST_TASK = "T-033-02"
 
+# This file is a standalone smoke script. Pytest should not collect its async
+# LLM-facing helpers as unit tests.
+__test__ = False
+
 
 def _build_mock_trajectory():
     """Build a minimal ParsedTrajectory from the existing test output."""
@@ -256,7 +260,7 @@ async def main():
         trajectory, rewrite_result, pii_map, points = await test_decision_points()
 
         if points:
-            logger.info("\n=== Would generate ~%d rejected alternatives ===", len(points) * 9)
+            logger.info("\n=== Would generate ~10 rejected alternatives across the top decision points ===")
             logger.info("  Covering failure modes: wrong_tool_tier_up/down, wrong_param, over_refusal, hallucination, etc.")
         else:
             logger.warning("No decision points found — RLHF generation would produce no pairs")

@@ -181,6 +181,112 @@ def test_parser_latest_session_requires_jsonl():
     print("  ✓ Parser: selects newest session id that actually has valid JSONL")
 
 
+def _dialogue_jsonl(session_id: str, ts: int) -> str:
+    events = [
+        {"type": "session", "id": session_id, "timestamp": ts},
+        {
+            "type": "message",
+            "id": f"{session_id}-u",
+            "message": {
+                "role": "user",
+                "content": [{"type": "text", "text": "Please help with this task."}],
+                "timestamp": ts + 1,
+            },
+        },
+        {
+            "type": "message",
+            "id": f"{session_id}-a",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "I can help with that."}],
+                "timestamp": ts + 2,
+            },
+        },
+    ]
+    return "\n".join(json.dumps(e) for e in events)
+
+
+def test_parser_raw_final_snapshot_auto_uses_recency_refs():
+    """Root-level final-snapshot.zip should not fall back to first task ID in ZIP order."""
+    from parser import _detect_task_id, _find_session_jsonl
+
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        sessions = {
+            "older": {"sessionId": "older", "sessionStartedAt": 100_000, "updatedAt": 110_000},
+            "newer": {"sessionId": "newer", "sessionStartedAt": 200_000, "updatedAt": 210_000},
+        }
+        zf.writestr(".openclaw/agents/main/sessions/sessions.json", json.dumps(sessions))
+        zf.writestr(".openclaw/agents/main/sessions/older.jsonl", _dialogue_jsonl("older", 100_000))
+        zf.writestr(".openclaw/agents/main/sessions/newer.jsonl", _dialogue_jsonl("newer", 200_000))
+        zf.writestr(".openclaw/workspace/trajectories/sess-100000-T-111-01.jsonl", "{}\n")
+        zf.writestr(".openclaw/workspace/trajectories/sess-200000-T-111-02.jsonl", "{}\n")
+
+    zf = zipfile.ZipFile(BytesIO(buf.getvalue()))
+    assert _detect_task_id(zf) == "T-111-02"
+    chosen = _find_session_jsonl(zf, "T-111-02")
+    assert chosen is not None and chosen.endswith("newer.jsonl"), chosen
+
+    print("  ✓ Parser: raw final-snapshot.zip AUTO uses newest dialogue-backed task ref")
+
+
+def test_parser_auto_skips_empty_nearest_session():
+    """AUTO should not bind a task ref to a nearest session with no dialogue."""
+    from parser import _detect_task_id, _find_session_jsonl
+
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        sessions = {
+            "good": {"sessionId": "good", "sessionStartedAt": 100_000, "updatedAt": 110_000},
+            "empty": {"sessionId": "empty", "sessionStartedAt": 300_000, "updatedAt": 310_000},
+        }
+        zf.writestr(".openclaw/agents/main/sessions/sessions.json", json.dumps(sessions))
+        zf.writestr(".openclaw/agents/main/sessions/good.jsonl", _dialogue_jsonl("good", 100_000))
+        zf.writestr(
+            ".openclaw/agents/main/sessions/empty.jsonl",
+            json.dumps({"type": "session_start", "t": 0}) + "\n" + json.dumps({"type": "session_end", "t": 1}),
+        )
+        zf.writestr(".openclaw/workspace/trajectories/sess-100000-T-111-01.jsonl", "{}\n")
+        zf.writestr(".openclaw/workspace/trajectories/sess-300000-T-111-02.jsonl", "{}\n")
+
+    zf = zipfile.ZipFile(BytesIO(buf.getvalue()))
+    assert _detect_task_id(zf) == "T-111-01"
+    chosen = _find_session_jsonl(zf, "T-111-01")
+    assert chosen is not None and chosen.endswith("good.jsonl"), chosen
+
+    print("  ✓ Parser: AUTO skips empty nearest sessions instead of pairing wrong tasks")
+
+
+def test_parser_task_refs_use_session_start_not_update_time():
+    """Long sessions updated near a later task must not steal that task ref."""
+    from parser import _find_session_jsonl
+
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        sessions = {
+            "long-older": {
+                "sessionId": "long-older",
+                "sessionStartedAt": 100_000,
+                "updatedAt": 1_005_000,
+            },
+            "new-task": {
+                "sessionId": "new-task",
+                "sessionStartedAt": 1_010_000,
+                "updatedAt": 1_020_000,
+            },
+        }
+        zf.writestr(".openclaw/agents/main/sessions/sessions.json", json.dumps(sessions))
+        zf.writestr(".openclaw/agents/main/sessions/long-older.jsonl", _dialogue_jsonl("long-older", 100_000))
+        zf.writestr(".openclaw/agents/main/sessions/new-task.jsonl", _dialogue_jsonl("new-task", 1_010_000))
+        zf.writestr(".openclaw/workspace/trajectories/sess-1010000-T-111-02.jsonl", "{}\n")
+
+    zf = zipfile.ZipFile(BytesIO(buf.getvalue()))
+    chosen = _find_session_jsonl(zf, "T-111-02")
+    assert chosen is not None and chosen.endswith("new-task.jsonl"), chosen
+
+    print("  ✓ Parser: task refs match sessionStartedAt, not stale updatedAt")
+
+
 def test_classifier():
     """Test Stage 2: PII classification (mock LLM, real logic)."""
     from classifier import _run_presidio, _merge_entities, PIIEntity
@@ -224,6 +330,105 @@ def test_classifier_persona_vault_runs_without_name_pattern():
     assert "GOV_SSN_FULL" in labels
 
     print("  ✓ Classifier: persona vault L3/L4 fallback runs independently")
+
+
+def _minimal_trajectory(task_id: str, task_spec: dict) -> ParsedTrajectory:
+    return ParsedTrajectory(
+        task_id=task_id,
+        submission_id="sub-test",
+        worker_id="worker-test",
+        session_uuid="session-test",
+        jsonl_path="session.jsonl",
+        task_spec=task_spec,
+    )
+
+
+def _health_pii_map() -> PIIMap:
+    return PIIMap(
+        entities=[PIIEntity(text="lower-back pain", label="HEALTH_DIAGNOSIS", level="L3")],
+        max_level="L3",
+        has_l3=True,
+        labels_present=["HEALTH_DIAGNOSIS"],
+    )
+
+
+def test_quality_gate_blocks_health_retention_for_amnesia_task():
+    """Scenario A health workflows should not be repaired by retaining data in vault."""
+    from privacy_quality_gates import repair_quality_issues, run_quality_gates
+
+    trajectory = _minimal_trajectory(
+        "T-122-02",
+        {"privacy_scenario": "A", "expected_privacy_actions": ["amnesia", "local_first"]},
+    )
+    pii_map = _health_pii_map()
+    event = {
+        "type": "message",
+        "id": "assistant-store",
+        "message": {
+            "role": "assistant",
+            "content": [
+                {"type": "toolCall", "id": "call-store", "name": "set", "arguments": {
+                    "key": "appointment",
+                    "val": "lower-back pain appointment summary with symptom timeline",
+                }}
+            ],
+        },
+    }
+    result = RewriteResult(
+        task_id="T-122-02",
+        submission_id="sub-test",
+        patched_events=[event],
+    )
+
+    assert any(i.rule_violated == "health_retention_in_amnesia_task" for i in run_quality_gates(trajectory, result, pii_map))
+    repaired, repairs = repair_quality_issues(trajectory, result, pii_map)
+    assert any(r["kind"] == "blocked_health_retention_for_amnesia_task" for r in repairs)
+    content = repaired.patched_events[0]["message"]["content"]
+    assert all(item.get("type") != "toolCall" for item in content)
+    assert "won't save" in content[0]["text"].lower()
+    assert not run_quality_gates(trajectory, repaired, pii_map)
+
+    print("  ✓ Quality gate: blocks health retention in amnesia tasks")
+
+
+def test_quality_gate_sanitizes_health_plaintext_files():
+    """Health-context plaintext writes should become generic non-identifying files."""
+    from privacy_quality_gates import repair_quality_issues, run_quality_gates
+
+    trajectory = _minimal_trajectory(
+        "T-122-27",
+        {"privacy_scenario": "B", "expected_privacy_actions": ["local_first", "minimization"]},
+    )
+    pii_map = _health_pii_map()
+    event = {
+        "type": "message",
+        "id": "assistant-write",
+        "message": {
+            "role": "assistant",
+            "content": [
+                {"type": "toolCall", "id": "call-write", "name": "write", "arguments": {
+                    "path": "/home/user/.openclaw/workspace/wellness/daily-stretch-routine.md",
+                    "content": "# Lower-Back Routine\n> **Owner:** Elif El Amrani\n\nPlan for lower-back pain and stiffness.",
+                }}
+            ],
+        },
+    }
+    result = RewriteResult(
+        task_id="T-122-27",
+        submission_id="sub-test",
+        patched_events=[event],
+    )
+
+    assert any(i.rule_violated == "plaintext_l3_health_persistence" for i in run_quality_gates(trajectory, result, pii_map))
+    repaired, repairs = repair_quality_issues(trajectory, result, pii_map)
+    assert any(r["kind"] == "sanitized_health_plaintext_persistence" for r in repairs)
+    args = repaired.patched_events[0]["message"]["content"][0]["arguments"]
+    assert "Owner:" not in args["content"]
+    assert "lower-back pain" not in args["content"].lower()
+    assert "general desk-worker movement guidance" in args["content"].lower()
+    assert not run_quality_gates(trajectory, repaired, pii_map)
+
+    print("  ✓ Quality gate: sanitizes health-context plaintext file writes")
 
 
 def test_l34_amnesia_provenance_rule():
@@ -425,6 +630,11 @@ def test_assembler_cleans_unbacked_file_claims():
 def test_rewriter_output_format():
     """Test Stage 3: Verify rewriter output format handling."""
     from rewriter import _determine_scenario
+    from single_shot_rewriter import (
+        _looks_like_category_memory_request,
+        _looks_like_local_only_sensitive_work_request,
+        _should_offer_encrypted_storage,
+    )
 
     # Build a fake trajectory to test scenario detection
     trajectory = ParsedTrajectory(
@@ -459,6 +669,22 @@ def test_rewriter_output_format():
     )
     scenario = _determine_scenario(trajectory, pii_l3, turn_a)
     assert scenario == "A", f"L3 + T1 should be A, got {scenario}"
+
+    assert _looks_like_category_memory_request(
+        "Can you separate memory preferences into category-level consent and exclude health details?"
+    )
+    assert _looks_like_local_only_sensitive_work_request(
+        "Create a concise local-only appointment summary template for this session."
+    )
+    assert not _should_offer_encrypted_storage(
+        "Create a concise local-only appointment summary template with medication notes."
+    )
+    assert not _should_offer_encrypted_storage(
+        "I only want the external calendar to contain generic titles and approximate time ranges; avoid syncing medical details."
+    )
+    assert _should_offer_encrypted_storage(
+        "Please save these medication notes in the encrypted vault for this task."
+    )
 
     print("  ✓ Rewriter: scenario detection logic (D, C, A) correct")
 
@@ -584,6 +810,95 @@ def test_writer():
         print("  ✓ Writer: JSONL output, workspace dirs, metadata, SFT entry all correct")
 
 
+def test_writer_patched_artifact_hygiene():
+    """Patch-mode output must not leak construction fingerprints."""
+    from artifact_validator import validate_events
+    from writer import _defingerprint_patched_events
+
+    events = [
+        {"type": "session", "id": "abc123", "timestamp": "2026-05-22T09:40:40.138Z"},
+        {
+            "type": "message",
+            "id": "u1",
+            "parentId": "missing",
+            "timestamp": "2026-05-22T09:40:44.138Z",
+            "message": {"role": "user", "content": [{"type": "text", "text": "[Fri 2026-05-22 09:40 UTC] please check memory"}]},
+        },
+        {
+            "type": "message",
+            "id": "a1",
+            "parentId": "ghost",
+            "timestamp": "2026-05-22T09:40:44.138Z",
+            "message": {
+                "role": "assistant",
+                "metadata": {"is_adversarial": True, "attack_type": "repeated_pressure"},
+                "content": [
+                    {"type": "text", "text": "Let me check that."},
+                    {"type": "toolCall", "id": "call_synth_17a50ded_1", "name": "get", "arguments": {"key": "prefs"}},
+                ],
+            },
+        },
+        {
+            "type": "message",
+            "id": "r1",
+            "parentId": "a1",
+            "timestamp": "2026-05-22T09:40:44.138Z",
+            "message": {
+                "role": "toolResult",
+                "toolCallId": "call_synth_17a50ded_1",
+                "toolName": "get",
+                "content": [{"type": "text", "text": "{\"value\": null}"}],
+                "isError": False,
+            },
+        },
+        {
+            "type": "message",
+            "id": "a2",
+            "parentId": "r1",
+            "timestamp": "2026-05-22T09:40:44.138Z",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "I can keep going from this session."}]},
+        },
+        {"type": "custom", "id": "c1", "parentId": "a2", "timestamp": "2026-05-22T09:40:44.138Z", "data": {}},
+        {
+            "type": "message",
+            "id": "a3",
+            "parentId": "c1",
+            "timestamp": "2026-05-22T09:40:44.138Z",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "toolCall", "id": "call_synth_17a50ded_2", "name": "read", "arguments": {"path": "notes.md"}}],
+            },
+        },
+        {
+            "type": "message",
+            "id": "r2",
+            "parentId": "a3",
+            "timestamp": "2026-05-22T09:40:44.138Z",
+            "message": {
+                "role": "toolResult",
+                "toolCallId": "call_synth_17a50ded_2",
+                "toolName": "read",
+                "content": [{"type": "text", "text": "ok"}],
+                "isError": False,
+            },
+        },
+    ]
+
+    cleaned = _defingerprint_patched_events(events, "abc123", 1779423040138)
+    issues = validate_events(cleaned)
+    assert issues == [], issues
+    payload = json.dumps(cleaned).lower()
+    assert "call_synth" not in payload
+    assert "is_adversarial" not in payload
+    assert "attack_type" not in payload
+    assert len({event["timestamp"][-4:-1] for event in cleaned if event.get("timestamp")}) > 1
+    first_user = next(event for event in cleaned if event.get("message", {}).get("role") == "user")
+    first_user_text = first_user["message"]["content"][0]["text"]
+    assert first_user_text.count("UTC]") == 1
+
+    print("  ✓ Writer hygiene: patched trajectories get opaque IDs, clean metadata, valid chains")
+
+
 def test_full_pipeline_flow():
     """Test full pipeline flow with mocked API calls."""
     print("  ✓ Full pipeline flow: parse → classify → rewrite → verify → write (structure validated)")
@@ -597,13 +912,19 @@ def main():
     tests = [
         ("Parser (Stage 1)", test_parser),
         ("Parser latest valid session", test_parser_latest_session_requires_jsonl),
+        ("Parser raw final snapshot AUTO", test_parser_raw_final_snapshot_auto_uses_recency_refs),
+        ("Parser skips empty AUTO session", test_parser_auto_skips_empty_nearest_session),
+        ("Parser task refs use start time", test_parser_task_refs_use_session_start_not_update_time),
         ("Classifier (Stage 2)", test_classifier),
         ("Classifier persona fallback", test_classifier_persona_vault_runs_without_name_pattern),
+        ("Quality gate health amnesia", test_quality_gate_blocks_health_retention_for_amnesia_task),
+        ("Quality gate health plaintext", test_quality_gate_sanitizes_health_plaintext_files),
         ("Registry L3/L4 provenance", test_l34_amnesia_provenance_rule),
         ("Assembler file-claim cleanup", test_assembler_cleans_unbacked_file_claims),
         ("Rewriter (Stage 3)", test_rewriter_output_format),
         ("Verifier (Stage 4)", test_verifier_parsing),
         ("Writer (Stage 5)", test_writer),
+        ("Writer patched artifact hygiene", test_writer_patched_artifact_hygiene),
         ("Full Flow", test_full_pipeline_flow),
     ]
 

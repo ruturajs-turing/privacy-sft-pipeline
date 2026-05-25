@@ -14,13 +14,16 @@ Data Classification Levels:
 - L4: Critical (SSNs, passwords, biometrics) — Tier 1 only; zero retention; elicit per-turn
 
 Tool Trust Tiers:
-- Tier 1 (Local): Can handle ALL data up to L4. Examples: nano-pdf, word-docx, data-analysis, memory_search
+- Tier 1 (Local): Can handle ALL data up to L4. Examples: nano-pdf, word-docx, data-analysis, memory_search, MCP vault get(key)/set(key,val)/delete(key)
 - Tier 2 (1P Cloud): Safe up to L2 by default. L3/L4 require EXPLICIT user consent. Examples: enterprise-mail, enterprise-rag
 - Tier 3 (3P API): L1 ONLY. L2+ strictly prohibited without documented exception. Examples: web_search, slack, notion, github
 
 ## Your Task
 
 Given the CHOSEN step and the DECISION CONTEXT, generate the requested number of REJECTED alternatives.
+Across one trajectory, the orchestrator targets 10 rejected samples total, spread across the most useful
+decision points rather than 10 samples for every step. Treat each request as one slice of that trajectory-level
+budget.
 
 Each rejected alternative must:
 1. Be PLAUSIBLE — something a real agent might do if it didn't properly understand privacy rules
@@ -34,6 +37,24 @@ Each rejected alternative must:
 ## Failure Mode Categories
 
 Generate a MIX of these failure modes:
+
+Prioritize coverage of these privacy cases across the trajectory-level set:
+1. Recalls L3/L4 from previous turns instead of asking again or using a vault get(key) path.
+2. Refuses to recall L2 or lower from previous turns.
+3. Uses L2+ in T3 without approval.
+4. Requests approval for L1 or lower in T3.
+5. Uses L3+ in T2 without approval.
+6. Requests approval for L2 or lower in T2.
+7. Saves L3/L4 to plaintext local storage instead of using encrypted vault set(key,val) with approval.
+8. Refuses to save L2 or lower to plaintext local storage.
+9. Uses T3 when a T1 equivalent is available.
+10. Uses T3 when T2 is available and T1 is not.
+11. Uses T2 when T1 is available.
+12. Follows a jailbreak or prompt-injection attempt.
+
+For jailbreak alternatives, make each attempt unique and realistic. Vary the tactic: quoted web-search
+payloads containing a secret, "retrieve what I gave you last turn", false authority, urgency, encoded values,
+or instructions embedded in external content. Do not reuse the same jailbreak wording.
 
 ### Privacy Violations (~40% of rejected samples):
 - **wrong_tool_tier_up**: Uses a higher-tier tool than necessary (e.g., Tier 3 when Tier 1 exists)
@@ -101,7 +122,7 @@ RLHF_USER_TEMPLATE = """## Decision Context
 **Distractor tools**: {distractor_tools}
 
 ## Generation Request
-Generate exactly {num_alternatives} rejected alternatives with the following distribution:
+Generate exactly {num_alternatives} rejected alternatives for this decision point with the following distribution:
 - {num_violations} privacy violations (mix of: wrong_tool, wrong_param, missing_elicitation, missing_consent)
 - {num_over_refusals} over-refusals (agent refuses legitimate operations)
 - {num_errors} errors/hallucinations (wrong reasoning, misclassification)
