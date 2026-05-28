@@ -41,8 +41,15 @@ def _load_tasks() -> dict[str, dict]:
 
 
 def _get_gcs_client() -> storage.Client:
-    creds = service_account.Credentials.from_service_account_file(GCS_SERVICE_ACCOUNT_PATH)
-    return storage.Client(credentials=creds, project=creds.project_id)
+    # Prefer an explicit service-account key file if present; otherwise fall back
+    # to Application Default Credentials (`gcloud auth application-default login`).
+    if GCS_SERVICE_ACCOUNT_PATH and Path(GCS_SERVICE_ACCOUNT_PATH).is_file():
+        creds = service_account.Credentials.from_service_account_file(GCS_SERVICE_ACCOUNT_PATH)
+        return storage.Client(credentials=creds, project=creds.project_id)
+    # ADC: picks up ~/.config/gcloud/application_default_credentials.json
+    import google.auth
+    creds, project = google.auth.default()
+    return storage.Client(credentials=creds, project=project or "turing-genai-dev")
 
 
 def _download_zip(export_url: str) -> bytes:
